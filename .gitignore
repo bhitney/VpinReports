@@ -1,0 +1,48 @@
+# Local environments and IDE state
+.venv/
+venv/
+.vs/
+
+# Python bytecode, caches, and build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local databases and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Generated reports and performance data
+[Vv][Pp][Ii][Nn][Ss][Tt][Aa][Tt][Ss][Rr][Ee][Pp][Oo][Rr][Tt].[Hh][Tt][Mm][Ll]
+HistoryReport.html
+CustomPerfStats_*.csv
+PresentMon_*.csv
+PresentMon_*.txt
+ai_recommendations.json
+
+# Local secrets, logs, and temporary files
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
