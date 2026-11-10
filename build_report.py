@@ -39,10 +39,12 @@ def parse_args():
     ap.add_argument("--emus", default=cfg.TARGET_EMU_IDS, help="comma-separated emulator IDs")
     ap.add_argument("--days", type=int, default=int(cfg.HISTORY_DAYS), help="history window in days")
     ap.add_argument("--perf-csv", default=cfg.PERF_CSV, help="pre-extracted CustomPerfStats CSV for the perf tab")
-    ap.add_argument("--perf-logs", default=getattr(cfg, "PERF_LOGS_DIR", None),
-                    help="VPinPerfMon logs folder for the perf drill-down (default: folder in FileRawDataPath)")
+    ap.add_argument("--perf-logs", action="append", default=None,
+                    help="VPinPerfMon logs folder; repeat for alternate locations (overrides PERF_LOGS_DIR)")
     ap.add_argument("--out", default=os.path.join(HERE, "VpinStatsReport.html"))
     args = ap.parse_args()
+    if args.perf_logs is None:
+        args.perf_logs = getattr(cfg, "PERF_LOGS_DIR", None)
     args.emus = ",".join(p.strip() for p in str(args.emus).split(",") if p.strip())
     if not re.fullmatch(r"\d+(,\d+)*", args.emus):
         sys.exit(f"Emulator IDs must be comma-separated integers, got: {args.emus!r}")

@@ -26,7 +26,7 @@ Edit `report_config.py`:
 | `TARGET_EMU_IDS` | Emulator IDs for History and Performance tabs (`"4,6,10"`) |
 | `HISTORY_DAYS` | Play History window |
 | `RECS_PATH` | `ai_recommendations.json`; defaults to a sibling `..\Vpin-AI-Recommender` checkout |
-| `PERF_LOGS_DIR` | VPinPerfMon logs folder for the drill-down (`--perf-logs`); defaults to the folder in `FileRawDataPath` |
+| `PERF_LOGS_DIR` | Logs path or list of paths: first is primary, others are alternate locations to copy on other PCs. `None` or `[]` uses `FileRawDataPath`. Repeat `--perf-logs` to override with one or more paths. |
 | `PERF_CSV` | Optional pre-extracted CustomPerfStats CSV (bypasses the DB and emulator filter for the perf tab) |
 
 Command-line options override the config.
@@ -45,7 +45,7 @@ Raw PresentMon CSVs are too large to embed, so the report reads them on demand f
 
 1. Click any point in a perf chart, or pick a run in the **Run drill-down** section.
 2. Click **Connect logs folder…** and choose the VPinPerfMon logs folder (runs are matched by the file name in `FileRawDataPath`; ● marks runs that were found), or use **Open CSV…** / drag-and-drop a single CSV. In Edge/Chrome the folder is remembered, so a regenerated report offers **Reconnect** next time.
-   Browsers can't open a local path on their own, so the section shows the **Expected logs folder** with a **Copy path** button. Paste it into the folder picker's address bar. That path is `PERF_LOGS_DIR` in `report_config.py` (or `build_report.py --perf-logs "<folder>"`), or otherwise the most common folder in `FileRawDataPath`. Set it when the report is viewed on a different PC than the one that recorded the runs. At build time the report checks which CSVs are in that folder: ○ marks those runs until a folder is connected, and a missing file shows its full expected path.
+   Browsers can't open a local path on their own, so the section shows the **Expected logs folder** and any **Alternate logs folder** entries, each with a **Copy path** button. Copy the path appropriate for this PC and paste it into the folder picker's address bar. Set `PERF_LOGS_DIR` to a single path or a list such as `[r"C:\vPinball\mytools\VPinPerfMon\logs", r"\\cabinet\VPinPerfMon\logs"]`. The first path is primary; additional paths are convenience shortcuts only and need not be accessible from the build PC. Alternatively, use `build_report.py --perf-logs "<primary>" --perf-logs "<alternate>"` (replaces the configured list). Without configured paths, the report uses the most common folder in `FileRawDataPath`. At build time only the primary folder is checked: ○ marks those runs until a folder is connected, and a missing file shows its full expected primary path. Copying a path does not connect a folder; use **Connect logs folder…** to grant browser access.
 3. You get a zoomable frame timeline (displayed vs frame time, missed refreshes, warm-up/trim/worst-cluster shading), synced CPU/GPU busy chart, an on-screen-time histogram, a list of stalls with a heuristic "likely cause", and a recheck of every grade value against the database.
 
 The grade is recomputed in `perf_drilldown.js` with the run's stored `Cfg*` settings. The warm-up (`--delaystart`) varies by launcher/emulator; it is taken from, in order:

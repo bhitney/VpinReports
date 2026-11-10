@@ -322,13 +322,18 @@ function drillRenderLogsHint() {
     : ' &middot; this folder wasn&rsquo;t found on the PC that built the report, so it may differ here.';
   const tip = drillLogs.source !== 'config' && !(drillLogs.checked && drillLogs.found)
     ? ' To point the report elsewhere, rebuild with <code>--perf-logs</code> or set PERF_LOGS_DIR.' : '';
-  el.innerHTML = `Expected logs folder: <code>${escapeHtml(drillLogs.dir)}</code><button type="button" id="drillCopyPath">Copy path</button>` +
-    `(${from})${check} Tip: paste it into the folder picker&rsquo;s address bar.${tip}`;
+  const folders = [drillLogs.dir, ...(drillLogs.alternates || [])];
+  const paths = folders.map((path, i) =>
+    `<div>${i === 0 ? 'Expected logs folder' : 'Alternate logs folder'}: <code>${escapeHtml(path)}</code>` +
+    `<button type="button" data-drill-copy-path="${i}">Copy path</button></div>`).join('');
+  el.innerHTML = paths + `(${from})${check} Tip: paste a path into the folder picker&rsquo;s address bar, then connect that folder.${tip}`;
   el.hidden = false;
-  drillEl('drillCopyPath').addEventListener('click', async e => {
-    const ok = await drillCopyText(drillLogs.dir);
-    e.target.textContent = ok ? 'Copied' : 'Copy failed';
-    setTimeout(() => { e.target.textContent = 'Copy path'; }, 1500);
+  el.querySelectorAll('[data-drill-copy-path]').forEach(button => {
+    button.addEventListener('click', async () => {
+      const ok = await drillCopyText(folders[Number(button.dataset.drillCopyPath)]);
+      button.textContent = ok ? 'Copied' : 'Copy failed';
+      setTimeout(() => { button.textContent = 'Copy path'; }, 1500);
+    });
   });
 }
 

@@ -6,7 +6,7 @@ performance captures). Adapted from VPinPerfMon generate_scatter_report.py.
 This file is executed by build_report.py with these globals injected:
     SRC        DataFrame of CustomPerfStats rows, or a path to a CSV of them
     SRC_LABEL  human-readable description of the data source
-    PERF_LOGS_DIR  optional VPinPerfMon logs folder for the drill-down (None = from FileRawDataPath)
+    PERF_LOGS_DIR  optional logs path or list (first = primary; None/[] = from FileRawDataPath)
 and leaves PERF_CSS, PERF_BODY, PERF_SCRIPT and REPORT_INFO behind.
 
 See PERF_STATS_REPORT_PROCESS.md in the VPinPerfMon repo (Reporting folder) for methodology notes.
@@ -179,12 +179,24 @@ def _logs_info():
     """Where the drill-down's CSVs are expected, and (when that folder exists on the build machine)
     which runs actually have their CSV there. Runs get LogOnDisk 1/0, or None when unchecked."""
     configured = globals().get("PERF_LOGS_DIR")
+    if configured is None:
+        folders = []
+    elif isinstance(configured, str):
+        folders = [configured]
+    elif isinstance(configured, (list, tuple)):
+        folders = list(configured)
+    else:
+        raise ValueError("PERF_LOGS_DIR must be a path string, a list of paths, or None.")
+    if any(not isinstance(p, str) or not p.strip() for p in folders):
+        raise ValueError("PERF_LOGS_DIR paths must be non-empty strings.")
+    folders = list(dict.fromkeys(os.path.normpath(p) for p in folders))
     raw = df["FileRawDataPath"] if "FileRawDataPath" in df.columns else pd.Series(dtype=object)
     raw = raw.map(lambda p: p.strip() if isinstance(p, str) and p.strip() else None)
     dirs = raw.dropna().map(lambda p: re.sub(r"[\\/][^\\/]*$", "", p))
-    info = {"dir": None, "source": None, "checked": False, "found": 0, "total": int(raw.notna().sum())}
-    if configured:
-        info["dir"], info["source"] = os.path.normpath(str(configured)), "config"
+    info = {"dir": None, "alternates": folders[1:], "source": None,
+            "checked": False, "found": 0, "total": int(raw.notna().sum())}
+    if folders:
+        info["dir"], info["source"] = folders[0], "config"
     elif not dirs.empty:
         info["dir"], info["source"] = dirs.value_counts().index[0], "database"
     on_disk = pd.Series([None] * len(df), index=df.index, dtype=object)
@@ -194,7 +206,7 @@ def _logs_info():
             if p:
                 name = re.split(r"[\\/]", p)[-1]
                 # Without a configured folder each run is also checked at its own recorded path.
-                on_disk[i] = int(name.lower() in names or (not configured and os.path.isfile(p)))
+                on_disk[i] = int(name.lower() in names or (not folders and os.path.isfile(p)))
         info["checked"] = True
         info["found"] = int(sum(v == 1 for v in on_disk))
     return info, on_disk
