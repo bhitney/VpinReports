@@ -8,10 +8,10 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'perf_drilldown.js'), 
 const core = source.slice(source.indexOf('//#region drill-core'), source.indexOf('//#endregion drill-core'));
 const played = source.slice(source.indexOf('function drillPlayedAt('), source.indexOf('const drillBandsPlugin'));
 
-const context = vm.createContext({});
+const context = vm.createContext({ escapeHtml: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;') });
 vm.runInContext(core + played, context);
-const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall } = vm.runInContext(
-  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall })', context);
+const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml } = vm.runInContext(
+  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml })', context);
 
 // 10 s at 10 ms per frame: warm-up 2 s, tail trim 1 s (graded window 2 s .. 9 s).
 function buildCsv(modeAt) {
@@ -172,4 +172,32 @@ test('limiter call needs both GPU load and the stall causes', () => {
   assert.equal(drillLimiterCall(c(3, 2), 30, 40, cfg).call, 'unknown');
   // Custom bands (for example VR) move the thresholds.
   assert.equal(drillLimiterCall(c(2, 20), 80, 105, cfg, [70, 95]).call, 'unknown');
+});
+
+test('start/end time: file-name start plus capture length, no time zone conversion', () => {
+  const f = { name: 'PresentMon_20260822225834_Mariner (Bally 1971).csv' };
+  // Same day: the end shows only the time.
+  assert.equal(drillWhen(f, null, 3254).text, '2026-08-22 22:58:34 – 23:52:48');
+  // Crossing midnight (and a month end): the end shows the full date.
+  const late = { name: 'PresentMon_20260831235500_Game.csv' };
+  assert.equal(drillWhen(late, null, 600).text, '2026-08-31 23:55:00 – 2026-09-01 00:05:00');
+  // No usable span -> start only.
+  assert.equal(drillWhen(f, null, NaN).text, '2026-08-22 22:58:34');
+  // No file-name time: the database time is UTC, so it is shown alone as an approximate time, never as a range.
+  const db = drillWhen({ name: 'other.csv' }, { EntryDateTime: '2026-07-12 21:42:35' }, 600);
+  assert.equal(db.text, '2026-07-12 21:42:35');
+  assert.match(db.tip, /database/);
+  assert.equal(drillWhen({ name: 'other.csv' }, null, 600), null);
+});
+
+test('tile groups: empty groups are dropped, extra classes and hover text are kept and escaped', () => {
+  const html = drillTilesHtml([
+    { title: 'Run', tiles: [['7,284', 'graded frames']] },
+    { title: 'Load', tiles: [] },
+    { title: 'Diagnosis', tiles: [['Recording?', 'possible', 'a "quoted" <tip>', 'warn'], ['x', 'y', null, 'wide']] },
+  ]);
+  assert.equal((html.match(/<section class="drill-group">/g) || []).length, 2);
+  assert.ok(!html.includes('Load'));
+  assert.match(html, /drill-tile warn" title="a &quot;quoted&quot; &lt;tip>"/);
+  assert.match(html, /drill-tile wide">/);
 });

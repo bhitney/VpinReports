@@ -595,11 +595,11 @@ async function drillOfferReconnect() {
 
 const DRILL_MODE_COLOR = '#b07cff';
 const DRILL_MODE_INFO = {
-  'Hardware: Independent Flip': 'Best case: the game owns the screen and flips frames straight to it; Windows is not compositing anything on top.',
-  'Hardware Composed: Independent Flip': 'Also direct: frames go to the screen, but Windows may blend a small overlay (such as a cursor or notification) in hardware without a copy. Same performance class as Independent Flip.',
+  'Hardware: Independent Flip': 'The game has the screen to itself. Frames go straight to the display with no Windows compositing.',
+  'Hardware Composed: Independent Flip': 'Frames still go straight to the display, but Windows is blending a small overlay (such as a cursor or notification) in hardware, without copying the frame. Performance is essentially the same as plain Independent Flip.',
   'Hardware: Legacy Flip': 'Older exclusive-fullscreen style flip straight to the display.',
   'Hardware: Legacy Copy to front buffer': 'Older fullscreen path that copies each frame to the display buffer.',
-  'Composed: Flip': 'The Windows compositor (DWM) takes each frame and blends it with the desktop before display. Slightly more latency and more chance of hitches.',
+  'Composed: Flip': 'The Windows compositor (DWM) blends each frame with the rest of the desktop before it is shown. This can add a little latency.',
   'Composed: Copy with GPU GDI': 'Compositor path where the frame is copied by the GPU (windowed GDI-style apps).',
   'Composed: Copy with CPU GDI': 'Compositor path where the frame is copied by the CPU; slowest and rare.',
   'Composed: Composition Atlas': 'Frame is drawn through the compositor into a shared surface (typical of UWP / XAML content).',
@@ -609,13 +609,36 @@ const DRILL_MODE_INFO = {
 // accurate; fall back to the database entry time (end of run), then the file's modified time.
 function drillPlayedAt(file, rec) {
   const m = /_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:_|\.)/.exec(file?.name || '');
-  if (m) return { text: `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`, note: 'capture start (from file name)' };
+  if (m) return { text: `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`, note: 'capture start (from file name)', fromName: true };
   if (rec?.EntryDateTime) return { text: String(rec.EntryDateTime), note: 'database entry time' };
   if (file?.lastModified) {
     const d = new Date(file.lastModified), p = n => String(n).padStart(2, '0');
     return { text: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`, note: 'file modified time' };
   }
   return null;
+}
+
+// Start and end of the run for the title. The file-name time is local wall-clock time, so the end is that plus the
+// capture length (pure wall-clock arithmetic: no time zone or daylight-saving conversion). The database entry time is
+// UTC and is not used for the range. Without a file-name time only one approximate time is shown.
+function drillWhen(file, rec, spanSec) {
+  const p = drillPlayedAt(file, rec);
+  if (!p) return null;
+  const m = p.fromName ? /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(p.text) : null;
+  if (!m || !Number.isFinite(spanSec) || spanSec <= 0) return { text: p.text, tip: `Approximate: ${p.note}` };
+  const end = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6] + Math.round(spanSec)));
+  const endText = end.toISOString().replace('T', ' ').slice(0, 19);
+  const sameDay = endText.slice(0, 10) === p.text.slice(0, 10);
+  return { text: `${p.text} – ${sameDay ? endText.slice(11) : endText}`, tip: 'Start (from the capture file name) and end (start plus the capture length). Approximate to a few seconds.' };
+}
+
+// Tiles grouped into clusters by the question they answer; a group with no tiles is dropped.
+// A tile is [value, caption, hover text, optional extra css class].
+function drillTilesHtml(groups) {
+  return groups.filter(g => g.tiles.length).map(g =>
+    `<section class="drill-group"><h4>${g.title}</h4><div class="drill-tiles">` +
+    g.tiles.map(([v, l, tip, cls]) => `<div class="drill-tile${cls ? ' ' + cls : ''}"${tip ? ` title="${escapeHtml(tip)}"` : ''}><b>${v}</b>${l}</div>`).join('') +
+    '</div></section>').join('');
 }
 
 // Overall CPU / GPU utilization (avg with min / max) from the database record, when present.
@@ -625,8 +648,8 @@ function drillLoadChips(rec) {
   const chip = (name, avg, min, max, tip) => (avg != null && Number.isFinite(Number(avg))
     ? [[`${pct(min)} / ${pct(avg)} / ${pct(max)}`, `${name} (min / avg / max)`, tip]] : []);
   return [
-    ...chip('CPU', rec.CpuAverage, rec.CpuMin, rec.CpuMax, 'Total processor utilization of the whole machine (not just the game), sampled about once per second.'),
     ...chip('GPU', rec.GpuAverage, rec.GpuMin, rec.GpuMax, 'Utilization of GPU 0 from NVIDIA NVML, sampled about once per second.'),
+    ...chip('CPU', rec.CpuAverage, rec.CpuMin, rec.CpuMax, 'Total processor utilization of the whole machine (not just the game), sampled about once per second.'),
   ];
 }
 
@@ -637,22 +660,22 @@ const drillLoadLabel = pct => (!Number.isFinite(pct) ? '' : pct < drillBands()[0
 // Lead with GPU load ("is the graphics card the limit?"); blame is secondary and shown with the stall counts behind it.
 function drillBlameChips(res, rec) {
   const c = res.stallCounts, minStalls = res.cfg.BlameMinStalls;
-  const chips = [];
+  const out = { load: [], blame: [], limiter: [] };
   const stored = Number(rec?.GpuBusyPctOfRefresh);
   const load = Number.isFinite(stored) ? stored : res.gpuLoadPct;
   if (Number.isFinite(load)) {
-    chips.push([`${load.toFixed(0)}% \u00b7 ${drillLoadLabel(load)}`, 'GPU load (median GPU busy as % of refresh)',
+    out.load.push([`${load.toFixed(0)}% \u00b7 ${drillLoadLabel(load)}`, 'GPU load (median GPU busy as % of refresh)',
       `Median GPU busy time per frame as a percent of the refresh interval. Under ${drillBands()[0]}% = headroom, ${drillBands()[0]}-${drillBands()[1]}% = moderate, over ${drillBands()[1]}% = high. Bands are set by GPU_LOAD_BANDS in report_config.py (raise them for VR).`]);
   }
   const enough = c.cpu + c.gpu >= minStalls;
   const legacy = rec && rec.BlameLegacy === 1;
   const blameText = enough && res.blameCpuPct != null
     ? `CPU ${res.blameCpuPct.toFixed(0)}% / GPU ${res.blameGpuPct.toFixed(0)}%` : 'not enough app-caused stalls';
-  chips.push([blameText, `blame of ${c.cpu + c.gpu} CPU/GPU stalls (${c.cpu} CPU \u00b7 ${c.gpu} GPU)${legacy ? ' \u00b7 legacy formula in DB' : ''}`,
+  out.blame.push([blameText, `blame of ${c.cpu + c.gpu} CPU/GPU stalls (${c.cpu} CPU \u00b7 ${c.gpu} GPU)${legacy ? ' \u00b7 legacy formula in DB' : ''}`,
     `The CPU-vs-GPU share of the stalls the app itself caused, weighted by milliseconds over the refresh. Present-mode-switch, display/compositor and app-waiting stalls are not blamed on either side. Needs at least ${minStalls} CPU+GPU stalls; otherwise it is not reported.`]);
   const lim = res.limiter;
-  if (lim && lim.call !== 'unknown') chips.push([lim.label, 'likely limiter', `${lim.detail}. Combines GPU load with the stall causes; a run is not called CPU-bound just because GPU load is low.`]);
-  return chips;
+  if (lim && lim.call !== 'unknown') out.limiter.push([lim.label, 'likely limiter', `${lim.detail}. Combines GPU load with the stall causes; a run is not called CPU-bound just because GPU load is low.`]);
+  return out;
 }
 
 const DRILL_REC_MIN_CHANGES = 4;
@@ -754,31 +777,40 @@ function drillRender(csv, res, rec, file) {
   const sec = ms => (ms - res.t0) / 1000;
   const refresh = res.refresh;
 
+  const when = drillWhen(file, rec, res.t0 != null ? (st[res.chain[res.chain.length - 1]] - res.t0) / 1000 : NaN);
+  const whenHtml = when ? ` <span class="drill-when" title="${escapeHtml(when.tip)}">${escapeHtml(when.text)}</span>` : '';
   drillEl('drillTitle').innerHTML = rec
-    ? `${escapeHtml(rec.Table)} <span class="muted">&middot; ${escapeHtml(rec.EntryDateTime)} &middot; ${escapeHtml(rec.EmuDisplay ?? '')} &middot; <code>${escapeHtml(file.name)}</code></span>`
-    : `<code>${escapeHtml(file.name)}</code> <span class="muted">&middot; not in this report &mdash; standalone analysis</span>`;
+    ? `${escapeHtml(rec.Table)}${whenHtml} <span class="muted">&middot; ${escapeHtml(rec.EmuDisplay ?? '')} &middot; <code>${escapeHtml(file.name)}</code></span>`
+    : `<code>${escapeHtml(file.name)}</code>${whenHtml} <span class="muted">&middot; not in this report &mdash; standalone analysis</span>`;
 
-  // ---- summary chips
+  // ---- summary tiles, grouped by the question they answer
   const causes = {};
   res.misses.forEach(m => { causes[m.cause] = (causes[m.cause] || 0) + 1; });
   const causeText = Object.entries(causes).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} (${n}x)`).join(' · ') || 'no stalls';
   const worstMiss = res.misses.reduce((w, m) => (!w || m.ratio > w.ratio ? m : w), null);
-  const played = drillPlayedAt(file, rec);
-  const chips = [
-    ...(played ? [[escapeHtml(played.text), 'Start Time', `Approximate: ${played.note}`]] : []),
-    [`${drillGradeTag(res.grade)} ${drillFmt(res.score, 1)}`, `recomputed grade${rec?.StutterGrade ? ` (DB: ${rec.StutterGrade} ${drillFmt(rec.StutterGradeScore, 1)})` : ''}${res.capped ? ' · capped' : ''}`],
-    [drillInt(res.frames), `graded frames · ${drillFmt(res.duration, 1)} s`],
-    [`${drillFmt(1000 / refresh, 1)} Hz`, `refresh (${drillFmt(refresh, 3)} ms, ${escapeHtml(res.refreshSource)})`],
-    [drillInt(res.misses.length), `missed refreshes (2×: ${res.doubled} · 3×+: ${res.triple})`],
-    [worstMiss ? `${drillFmt(worstMiss.ms, 1)} ms` : '&ndash;', worstMiss ? `longest stall (${worstMiss.refreshes} refreshes) at ${drillFmt(sec(st[worstMiss.r]), 1)} s` : 'longest stall'],
-    [`${drillFmt(res.effective, 3)}%`, `effective miss % (cluster ×${drillFmt(res.multiplier, 2)}, peak ${res.peak} per ${res.cfg.ClusterWindowSec} s)`],
-    [drillInt(res.modeChanges.length), 'present-mode changes', 'Present-mode changes while graded (after warm-up, before the trimmed tail). Usually caused by an overlay, popup or window focus change.'],
-    ...drillLoadChips(rec),
-    ...drillBlameChips(res, rec),
-    ...(drillRecordingSuspect(res, rec) ? [['Recording?', 'possible screen-recording session', `Repeated present-mode changes (${res.modeChanges.length}) with high average CPU (${drillFmt(rec.CpuAverage, 1)}%) is the typical signature of a screen recording (for example Popper's record screen) running during the capture, not normal play.`]] : []),
-    [escapeHtml(causeText), 'likely stall causes (number of stalls)'],
+  const blame = drillBlameChips(res, rec);
+  const recording = drillRecordingSuspect(res, rec);
+  const groups = [
+    { title: 'Run', tiles: [
+      [drillInt(res.frames), `graded frames · ${drillFmt(res.duration, 1)} s`],
+      [`${drillFmt(1000 / refresh, 1)} Hz`, `refresh (${drillFmt(refresh, 3)} ms, ${escapeHtml(res.refreshSource)})`],
+    ] },
+    { title: 'Smoothness', tiles: [
+      [`${drillGradeTag(res.grade)} ${drillFmt(res.score, 1)}`, `recomputed grade${rec?.StutterGrade ? ` (DB: ${rec.StutterGrade} ${drillFmt(rec.StutterGradeScore, 1)})` : ''}${res.capped ? ' · capped' : ''}`],
+      [drillInt(res.misses.length), `missed refreshes (2×: ${res.doubled} · 3×+: ${res.triple})`],
+      [worstMiss ? `${drillFmt(worstMiss.ms, 1)} ms` : '&ndash;', worstMiss ? `longest stall (${worstMiss.refreshes} refreshes) at ${drillFmt(sec(st[worstMiss.r]), 1)} s` : 'longest stall'],
+      [`${drillFmt(res.effective, 3)}%`, `effective miss % (cluster ×${drillFmt(res.multiplier, 2)}, peak ${res.peak} per ${res.cfg.ClusterWindowSec} s)`],
+    ] },
+    { title: 'Load', tiles: [...blame.load, ...drillLoadChips(rec)] },
+    { title: 'Diagnosis', tiles: [
+      ...(recording ? [['Recording?', 'possible screen-recording session', `Repeated present-mode changes (${res.modeChanges.length}) with high average CPU (${drillFmt(rec.CpuAverage, 1)}%) is the typical signature of a screen recording (for example Popper's record screen) running during the capture, not normal play.`, 'warn']] : []),
+      ...blame.limiter,
+      ...blame.blame,
+      [drillInt(res.modeChanges.length), 'present-mode changes', 'Present-mode changes while graded (after warm-up, before the trimmed tail). Usually caused by an overlay, popup or window focus change.'],
+      [escapeHtml(causeText), 'likely stall causes (number of stalls)', null, 'wide'],
+    ] },
   ];
-  drillEl('drillChips').innerHTML = chips.map(([v, l, tip]) => `<div${tip ? ` title="${escapeHtml(tip)}"` : ''}><b>${v}</b>${l}</div>`).join('');
+  drillEl('drillChips').innerHTML = drillTilesHtml(groups);
 
   // ---- swap chain selector + underlay toggle (only when the capture has several chains)
   const chainBar = drillEl('drillChainBar');

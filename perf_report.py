@@ -840,6 +840,15 @@ PERF_CSS += """#tab-perf {
                        border: 1px solid var(--cp-border); background: var(--cp-surface-soft); color: var(--cp-text); }
   .drill-hint button:hover { border-color: var(--cp-accent); color: var(--cp-accent); }
   .drill-chain { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin: 10px 0; font-size: 13px; color: var(--cp-text-muted); }
+  .drill-when { font-size: 13px; font-weight: 400; color: var(--cp-text-muted); margin-left: 6px; font-variant-numeric: tabular-nums; }
+  .drill-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; margin: 14px 0 20px; align-items: start; }
+  .drill-group { background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: var(--radius); padding: 10px 12px 12px; }
+  .drill-group h4 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--cp-text-muted); }
+  .drill-tiles { display: flex; flex-direction: column; gap: 8px; }
+  .drill-tile { background: var(--cp-surface-soft); border: 1px solid var(--cp-border); border-radius: 8px; padding: 8px 12px; font-size: 12px; color: var(--cp-text-muted); }
+  .drill-tile b { display: block; font-size: 17px; line-height: 1.3; color: var(--cp-chart-point); overflow-wrap: anywhere; }
+  .drill-tile.warn { border-color: var(--cp-warning); }
+  .drill-tile.warn b { color: var(--cp-warning); }
   .drill-chain select { max-width: 640px; padding: 4px 8px; border-radius: 0.5rem; border: 1px solid var(--cp-border); background: var(--cp-surface-soft); color: var(--cp-text); }
   .drill-status { font-size: 13px; color: var(--cp-text-muted); margin: 10px 0 4px; min-height: 18px; }
   .drill-status.warn { color: var(--cp-warning); }
@@ -1729,8 +1738,8 @@ function applyView() {{
       const pts = q ? [...allPts.filter(p => !isMatch(p)), ...allPts.filter(isMatch)] : allPts;
       ds.data = pts;
       ds.pointBackgroundColor = pts.map(p => pointColor(def, p));
-      ds.pointBorderColor = pts.map(p => isMatch(p) ? searchHighlightColor : pointColor(def, p));
-      ds.pointBorderWidth = pts.map(p => isMatch(p) ? 2.5 : 1);
+      ds.pointBorderColor = pts.map(p => isMatch(p) ? searchHighlightColor : pointBorder(def, p));
+      ds.pointBorderWidth = pts.map(p => isMatch(p) ? 2.5 : pointBorderWidth(def, p));
       ds.pointRadius = pts.map(p => pointRadius(def, p, max, isMatch(p) ? 7 : 4));
     }}
     ds.pointStyle = ds.data.map(p => p.edge != null ? 'triangle' : 'circle');
