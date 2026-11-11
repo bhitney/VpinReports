@@ -51,6 +51,10 @@ WHEEL_WIDTH = 150  # stored size; displayed at 75px so it stays sharp on high-DP
 # PERF_LOGS_DIR = [r"C:\vPinball\mytools\VPinPerfMon\logs", r"\\cabinet\VPinPerfMon\logs"]
 PERF_LOGS_DIR = None
 
+# GPU load bands for the Performance tab (GpuBusyPctOfRefresh, percent of the refresh interval):
+# below the first value = headroom, up to the second = moderate, above = high. Raise them for VR.
+GPU_LOAD_BANDS = (50, 85)
+
 # Optional: use a pre-extracted CustomPerfStats CSV for the Performance tab
 # instead of querying DB_PATH (EMU filter is not applied to CSVs). None = use DB.
 PERF_CSV = None

@@ -58,7 +58,7 @@ The grade counts **missed refreshes**: frames that stayed on screen for more tha
 
 ### Grading configuration (for reproducibility)
 
-`CfgDoubledRefreshes`, `CfgTripleRefreshes`, `CfgBandA`, `CfgBandB`, `CfgBandC`, `CfgBandD`, `CfgZeroScorePct`, `CfgTripleWeight`, `CfgTripleCapGrade`, `CfgTripleCapMinCount`, `CfgTrimStartSeconds`, `CfgTrimEndSeconds`, `CfgClusterWindowSec`, `CfgClusterWeight`, `CfgClusterMaxExcess`, `CfgClusterMinEvents`, `CfgClusterMinPeak`, `CfgMinFrames`.
+`CfgDoubledRefreshes`, `CfgTripleRefreshes`, `CfgBandA`, `CfgBandB`, `CfgBandC`, `CfgBandD`, `CfgZeroScorePct`, `CfgTripleWeight`, `CfgTripleCapGrade`, `CfgTripleCapMinCount`, `CfgTrimStartSeconds`, `CfgTrimEndSeconds`, `CfgClusterWindowSec`, `CfgClusterWeight`, `CfgClusterMaxExcess`, `CfgClusterMinEvents`, `CfgClusterMinPeak`, `CfgMinFrames`, `CfgBlameMinStalls`, `CfgBlameGpuSaturation`.
 
 These store the thresholds the row was graded with. They are constants unless the tool was run with non-default settings or the rules were retuned, so they are rarely worth charting. Use them to check that two rows were graded the same way before comparing them. The values at the time of writing are 1.5 refreshes (doubled), 2.5 (3+), bands 0.1 / 0.4 / 1 / 3, weight 3, cap at C when 2 or more 3+ frames, warm-up skipped (`CfgTrimStartSeconds`, the launcher's `--delaystart`: usually 30 s, longer for some launchers/emulators), 5 s tail dropped, 5 s windows, and a 100 frame minimum.
 
@@ -143,7 +143,41 @@ Caution: `CpuBusy` plus `CpuWait` is close to `FrameTime`, and a game that waits
 
 ## Bottleneck blame
 
-`BlameCpuPct` and `BlameGpuPct` (0-100, always sum to 100) look only at the worst 1% of frames by `FrameTime`. CPU blame is `CpuBusy * GpuWait` (the CPU was busy while the GPU was starved) and GPU blame is `GpuBusy * CpuWait`. Both are `NULL` when PresentMon gave no CPU and GPU timing. Treat as a rough hint: it has reported extreme values (for example "CPU 97.9%") on runs where wait time is counted as busy, so use it only to compare similar runs.
+`BlameCpuPct` and `BlameGpuPct` (0-100, always sum to 100) are the CPU-vs-GPU share of the **stalls the app itself caused**. A stall is a graded frame held for 1.5 refreshes or more. Each stall is classified (see [Stall causes](#stall-causes)), and the two numbers are the millisecond-weighted shares of the CPU-classified and GPU-classified stalls, where each stall weighs `DisplayedTime - refresh`. Present-mode-switch, app-waiting and display/compositor stalls are not blamed on either side.
+
+Both are `NULL` when CPU stalls plus GPU stalls is below `CfgBlameMinStalls` (default 8). `NULL` means "not enough app-caused stalls to say", not "no timing data". Most runs are `NULL`, so never build a headline on blame: lead with `GpuBusyPctOfRefresh` and show blame, with the stall counts behind it, as the secondary "what caused the hitches" view.
+
+`BlameVersion` records which formula produced the row: **4 is current; `NULL` or 1 is the legacy formula**. The legacy formula looked at the worst 1% of frames by `FrameTime` and used `CpuBusy * GpuWait` / `GpuBusy * CpuWait`. Frame-pacing limiters contaminated it, because `CpuBusy` includes the app's own limiter wait, so it reported extreme CPU blame on paced runs. Do not compare legacy and current values; the report labels anything below the highest version present as "legacy blame".
+
+### Stall causes
+
+| Columns | Meaning |
+|---|---|
+| `StallCpuCount`, `StallGpuCount`, `StallModeSwitchCount`, `StallAppWaitCount`, `StallDisplayCount` | Number of stalls per cause. Each stall falls in exactly one; the first matching rule below wins. |
+| `GpuBusyPctOfRefresh` | Median `GpuBusy` (frames with `GpuBusy > 0`, graded frames) as a percent of the refresh interval. The headline "is the graphics card the limit?" number. |
+| `CfgBlameMinStalls` | Minimum CPU+GPU stalls for blame to be reported (default 8). |
+| `CfgBlameGpuSaturation` | GPU rule threshold as a fraction of the refresh (default 0.9). |
+
+For stall frame `p` (next frame `p+1` on the same swap chain), with `refresh` the stored `GradeRefreshMs` or the median `DisplayedTime`:
+
+1. **CPU:** `max(CPUBusy[p], CPUBusy[p+1]) >= 1.5 * refresh` and not (max `GPUBusy` greater than max `CPUBusy`).
+2. **GPU:** `max(GPUBusy[p], GPUBusy[p+1]) >= CfgBlameGpuSaturation * refresh` **and** `max(FrameTime[p], FrameTime[p+1]) >= 1.5 * refresh`. The app must actually be late; otherwise a run with steady GPU load above 90% would label every unexplained stall as GPU.
+3. **Present-mode switch:** `PresentMode` of `p-1` or `p+1` differs from `p`. Frames before the first graded frame (warm-up) are never looked at.
+4. **App waiting / OS:** `FrameTime[p+1] >= 1.5 * refresh`.
+5. **Display / compositor:** anything else.
+
+A missing `CPUBusy`, `GPUBusy` or `FrameTime` on the next frame counts as 0. The report's run drill-down reproduces this classifier from the raw CSV and compares the counts and blame with these columns.
+
+### Reading GPU load together with the stalls
+
+The drill-down makes a derived call (report-side only, nothing stored): many stalls, high GPU load and GPU-labelled stalls point to a **GPU-limited** run; many stalls, low GPU load and mostly CPU-labelled stalls point to **CPU-limited**; mostly present-mode-switch, display or app-waiting stalls mean **neither** (a CPU or GPU upgrade will not fix it). Anything else is unknown. Both facts are needed: a run can show 97% GPU load while its stalls are CPU hitches. The load bands (under 50% headroom, 50-85% moderate, over 85% high) are `GPU_LOAD_BANDS` in `report_config.py`; raise them for VR.
+
+Frame pacing caveat: the classifier uses absolute limits (1.5 refreshes), not `CpuBusy` relative to the frame time, so paced runs are handled. A CPU label on a paced run can still occur if the limiter overshoots, so do not over-claim.
+
+### GPU identity
+
+`GpuName` and `GpuDriverVersion` are the NVML device name and driver at capture time. Use them as filter or group fields; expect a single value until rows from another machine arrive. They are `NULL` on rows captured before the columns existed.
+
 
 ## Suggested visuals and pitfalls
 

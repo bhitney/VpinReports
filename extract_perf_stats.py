@@ -55,7 +55,13 @@ ON g.EMUID = e.EMUID
 
 # Newer CustomPerfStats columns; selected only when the database has them so
 # older databases keep working.
-OPTIONAL_COLUMNS = ["CfgTrimStartSeconds", "CfgTimeoutSec"]
+OPTIONAL_COLUMNS = [
+    "CfgTrimStartSeconds", "CfgTimeoutSec",
+    # Stall-based blame (BlameVersion 4) and GPU identity; absent in databases that haven't been migrated.
+    "BlameVersion", "GpuBusyPctOfRefresh",
+    "StallCpuCount", "StallGpuCount", "StallModeSwitchCount", "StallAppWaitCount", "StallDisplayCount",
+    "CfgBlameMinStalls", "CfgBlameGpuSaturation", "GpuName", "GpuDriverVersion",
+]
 
 
 def build_query(con):

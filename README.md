@@ -62,3 +62,9 @@ The recheck follows VPinPerfMon's `StutterGrading`:
 - Values are parsed as 32-bit floats, so it matches the database exactly.
 
 The source used is shown under the recheck table. A CSV that doesn't match any run in the report is analyzed without the database comparison.
+
+### Stall causes, blame and GPU load
+
+Each stall (a graded frame held for 1.5 refreshes or more) is classified as CPU, GPU, present-mode switch, app waiting or display/compositor by the same rules as VPinPerfMon (BlameVersion 4); see `DATABASE_COLUMNS.md` for the rules. The recheck compares the five stall counts and the blame values with the database and shows a warning if they differ. The drill-down leads with **GPU load** (median GPU busy as a percent of the refresh, banded by `GPU_LOAD_BANDS` in `report_config.py`), then shows blame with the stall counts behind it. Blame is empty when there are fewer than `CfgBlameMinStalls` CPU+GPU stalls, which is most runs. A derived limiter call (GPU-limited, CPU-limited, neither, unclear) needs both the load and the stall causes. Databases that have not been migrated lack these columns; the report still builds and simply omits them, and rows graded with an older blame formula are labelled legacy.
+
+The drill-down can also switch between swap chains, mark present-mode changes, and flag a possible screen-recording session; the playfield is the chain with the highest GPU load when several tie on frame count.

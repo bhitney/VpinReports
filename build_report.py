@@ -301,7 +301,8 @@ def build_perf(args):
         os.path.join(HERE, "perf_report.py"),
         init_globals={"SRC": src, "SRC_LABEL": html.escape(label), "EMU_COLORS": getattr(cfg, "EMU_COLORS", {}),
                       "SEARCH_HIGHLIGHT_COLOR": getattr(cfg, "SEARCH_HIGHLIGHT_COLOR", None),
-                      "PERF_LOGS_DIR": args.perf_logs},
+                      "PERF_LOGS_DIR": args.perf_logs,
+                      "GPU_LOAD_BANDS": getattr(cfg, "GPU_LOAD_BANDS", None)},
     )
     section = {"css": ns["PERF_CSS"], "body": ns["PERF_BODY"], "script": ns["PERF_SCRIPT"]}
     return section, ns["REPORT_INFO"], ns["CHART_POINT_COLOR"]

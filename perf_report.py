@@ -11,6 +11,7 @@ and leaves PERF_CSS, PERF_BODY, PERF_SCRIPT and REPORT_INFO behind.
 
 See PERF_STATS_REPORT_PROCESS.md in the VPinPerfMon repo (Reporting folder) for methodology notes.
 """
+import html
 import json
 import os
 import re
@@ -22,6 +23,12 @@ import pandas as pd
 # Chart data colors are separate from the report UI theme so they can be
 # adjusted without editing the generated HTML or the Chart.js configuration.
 CHART_POINT_COLOR = "#4fd1c5"
+
+# GPU load bands (percent of the refresh interval): below the first = headroom, up to the second = moderate,
+# above = high. Injected from report_config.GPU_LOAD_BANDS; VR users will want higher values.
+GPU_LOAD_BANDS = tuple(globals().get("GPU_LOAD_BANDS") or (50, 85))
+if len(GPU_LOAD_BANDS) != 2 or not 0 < GPU_LOAD_BANDS[0] < GPU_LOAD_BANDS[1]:
+    sys.exit("GPU_LOAD_BANDS must be two ascending positive numbers, e.g. (50, 85).")
 
 # ---------------------------------------------------------------------------
 # 1. Load input
@@ -79,6 +86,13 @@ if HAS_GRADE:
 if HAS_EMULATOR:
     cols.append("EmuDisplay")
 cols += [c for c in ("CpuMin", "CpuMax", "GpuMin", "GpuMax") if c in df.columns]
+# Stall-based blame (BlameVersion 4) and GPU identity: all optional so unmigrated databases still build.
+BLAME_NUMERIC = [
+    "BlameVersion", "GpuBusyPctOfRefresh", "GpuBusy99th", "StallCpuCount", "StallGpuCount",
+    "StallModeSwitchCount", "StallAppWaitCount", "StallDisplayCount",
+]
+BLAME_TEXT = ["GpuName", "GpuDriverVersion"]
+cols += [c for c in BLAME_NUMERIC + BLAME_TEXT if c in df.columns and c not in cols]
 if HAS_GAME_RATING:
     cols.append("GameRating")
 HAS_GAME_ID = "GameID" in df.columns
@@ -153,6 +167,34 @@ if HAS_GRADE:
         RENDERER_COLORS[name] = RENDERER_PALETTE[i % len(RENDERER_PALETTE)]
     cols += ["GradeHz", "StallMs", "EntryTs", "Renderer"]
 
+# Stall-based blame (VPinPerfMon BlameVersion 4). Counts are per cause of the stalls the app itself caused.
+HAS_BLAME = "BlameVersion" in data.columns
+for c in BLAME_NUMERIC:
+    if c in data.columns:
+        data[c] = pd.to_numeric(data[c], errors="coerce")
+_blame_versions = data["BlameVersion"].dropna() if HAS_BLAME else pd.Series(dtype=float)
+LATEST_BLAME_VERSION = int(_blame_versions.max()) if len(_blame_versions) else None
+if HAS_BLAME:
+    # Anything below the highest version present (or NULL) used an older formula: label it, never mix it silently.
+    data["BlameLegacy"] = (data["BlameVersion"].isna() | (data["BlameVersion"] < LATEST_BLAME_VERSION)
+                           ).astype(int) if LATEST_BLAME_VERSION is not None else 1
+    cols.append("BlameLegacy")
+_stall_cols = ["StallCpuCount", "StallGpuCount", "StallModeSwitchCount", "StallAppWaitCount", "StallDisplayCount"]
+HAS_STALLS = all(c in data.columns for c in _stall_cols)
+if HAS_STALLS and HAS_GRADE:
+    _minutes = (data["GradeDurationSec"] / 60.0).where(data["GradeDurationSec"] > 0)
+    data["StallCpuPerMin"] = data["StallCpuCount"] / _minutes
+    data["StallTotal"] = data[_stall_cols].sum(axis=1, min_count=len(_stall_cols))
+    cols += ["StallCpuPerMin", "StallTotal"]
+if HAS_GRADE and "GpuBusyPctOfRefresh" not in data.columns:
+    # Older databases: no stored GPU load, so none is shown (the p99 form below is only a chart axis fallback).
+    data["GpuBusyPctOfRefresh"] = float("nan")
+if HAS_GRADE and "GpuBusy99th" in data.columns:
+    data["GpuBusyP99PctOfRefresh"] = pd.to_numeric(data["GpuBusy99th"], errors="coerce") / data["GradeRefreshMs"].where(data["GradeRefreshMs"] > 0) * 100
+    cols.append("GpuBusyP99PctOfRefresh")
+if HAS_GRADE and "GpuBusyPctOfRefresh" in data.columns and "GpuBusyPctOfRefresh" not in cols:
+    cols.append("GpuBusyPctOfRefresh")
+
 # Run drill-down: the browser re-reads a run's raw PresentMon CSV (picked by the user) and
 # re-grades it, so each record carries the CSV file name, swap chain and grading config.
 # All optional so older CSV extracts still build (the drill-down then just matches nothing).
@@ -162,6 +204,7 @@ DRILL_DEFAULT_CFG = {
     "CfgTripleCapGrade": "C", "CfgTripleCapMinCount": 2, "CfgClusterWindowSec": 5.0,
     "CfgClusterWeight": 0.1, "CfgClusterMaxExcess": 4.0, "CfgClusterMinEvents": 3,
     "CfgClusterMinPeak": 2, "CfgMinFrames": 100, "CfgTrimEndSeconds": 5.0,
+    "CfgBlameMinStalls": 8, "CfgBlameGpuSaturation": 0.9,
 }
 DRILL_CFGS = []  # distinct grading configs; records point at one via CfgIdx
 for c in ("GradeMissingFrames", "GradeRefreshSource", "SwapChainAddress"):
@@ -253,6 +296,20 @@ def point_list(source_records, xkey, ykey):
     return pts
 
 
+_LEGACY_BLAME_NOTE = (
+    " Rows graded with an older blame formula are labelled <b>legacy blame</b> in the tooltip; they came from a "
+    "different calculation (worst 1% of frames, which frame pacing contaminated) and are not comparable."
+    if HAS_BLAME else ""
+)
+BLAME_NOTE = (
+    "The CPU-vs-GPU share of the <b>stalls the app itself caused</b>, weighted by milliseconds over the refresh "
+    "&mdash; the two always add up to 100%. Present-mode-switch, display/compositor and app-waiting stalls are not "
+    "blamed on either side, and runs with too few CPU/GPU stalls (see <code>CfgBlameMinStalls</code>) have no blame "
+    "at all, so most runs are absent here. Lead with GPU load; this is the secondary &ldquo;what caused the hitches&rdquo; view."
+    + _LEGACY_BLAME_NOTE
+)
+
+
 chart_defs = [
     {
         "id": "fpsVsCpu", "title": "FPS Average vs CPU Average",
@@ -281,15 +338,9 @@ chart_defs = [
     },
     {
         "id": "blame", "title": "Blame CPU% vs Blame GPU% (bottleneck attribution)",
-        "x": "BlameCpuPct", "y": "BlameGpuPct",
+        "x": "BlameCpuPct", "y": "BlameGpuPct", "edgeMark": True,
         "xlabel": "Blame CPU %", "ylabel": "Blame GPU %",
-        "note": (
-            "Based only on the worst (bottom) 1% of frames in the capture, split between CPU-side and "
-            "GPU-side cause &mdash; the two always add up to 100%. High Blame GPU% means the GPU is the "
-            "limiting factor on the capture's worst frames; high Blame CPU% points at the CPU/driver side "
-            "instead. Caveat: frame pacing breaks this attribution. A paced app's CPU busy time includes its own "
-            "limiter wait, so CPU blame reads very high even when the CPU is not the real limit (common with BGFX VPX)."
-        ),
+        "note": BLAME_NOTE,
     },
     {
         "id": "fps1pctLow", "title": "FPS Average vs 1% Low FPS (consistency)",
@@ -376,6 +427,19 @@ if HAS_GRADE:
             ),
         },
     ]
+    if HAS_STALLS and "GpuBusyPctOfRefresh" in data.columns:
+        chart_defs.append({
+            "id": "gpuLoadVsCpuStalls", "title": "GPU Load vs CPU-Caused Stalls",
+            "x": "GpuBusyPctOfRefresh", "y": "StallCpuPerMin", "colorBy": "renderer", "legend": "renderer",
+            "focus": True,
+            "xlabel": "GPU load (median GPU busy, % of refresh)", "ylabel": "CPU-labelled stalls per minute",
+            "note": GRADE_NOTE_FILTER + (
+                "Does the GPU explain the hitches? Bottom-right (high GPU load, few CPU stalls) is busy but smooth; "
+                "top-left (low GPU load, many CPU stalls) is CPU-side hitching. A run can have high GPU load "
+                "<i>and</i> CPU stalls, so read both axes. Points are colored by renderer. Only runs graded with the "
+                "stall-based formula appear."
+            ),
+        })
 
 # focus: open zoomed on the bulk of runs; runs past ~2x the 98th percentile are pinned to the edge.
 FOCUS_NOTE = (
@@ -399,6 +463,30 @@ chart_defs.append({
         "(vsync/compositor/driver) is causing visible hitches. Prefer the stutter grade charts above."
     ),
 })
+
+# One- or two-sentence summaries shown under each chart; the longer note (if any) sits behind "More info".
+CHART_BRIEF = {
+    "fpsVsCpu": "Do busier CPUs mean lower FPS? One dot per run.",
+    "fpsVsGpu": "Do busier GPUs mean lower FPS? One dot per run.",
+    "cpuVsGpu": "CPU load against GPU load per run: which side is working harder.",
+    "frameTimeStability": "Average frame time against its spread. Dots high above the trend are uneven, stuttery runs.",
+    "fpsVsGpuMem": "FPS against GPU memory-interface load.",
+    "blame": "CPU vs GPU share of the stalls the app caused. Most runs are blank because they had too few stalls.",
+    "fps1pctLow": "Average FPS against the 1% low. Dots far below the rest have a ragged worst-case tail.",
+    "gradeDist": "Share of runs at each A&ndash;F grade, per emulator.",
+    "gradeVsCadence": "Do low scores cluster at particular display rates or frame caps?",
+    "missBreakdown": "Why a run scored badly: many small misses (bottom right) or a few long stalls (top left).",
+    "burstiness": "Steady stutter has a high rate and a modest peak; a burst has a low rate and a high peak.",
+    "missRates": "Plain vs effective miss rate. Lines mark the grade band edges.",
+    "gradeVsGpu": "Does heavier GPU load drive stutter?",
+    "gradeVsCpu": "Does heavier CPU load drive stutter? (CPU is whole-machine.)",
+    "longGaps": "Long gaps between presents, and how many of them were actually visible.",
+    "gpuLoadVsCpuStalls": "GPU load against CPU-caused stalls per minute: busy-but-smooth vs CPU hitching.",
+    "stutterScores": "Legacy smoothness scores. Prefer the grade charts above.",
+}
+for c in chart_defs:
+    if c["id"] in CHART_BRIEF:
+        c["brief"] = CHART_BRIEF[c["id"]]
 
 data["ConsistencyRatio"] = data["Fps1PctLow"] / data["FpsAverage"]
 
@@ -584,6 +672,30 @@ def build_report_state(filtered_data):
     }
 
 
+def _gpu_select(select_id, column, label):
+    if column not in data.columns:
+        return ""
+    values = sorted({str(v) for v in data[column].dropna() if str(v).strip()})
+    if not values:
+        return ""
+    options = "".join(f'<option value="{html.escape(v)}">{html.escape(v)}</option>' for v in values)
+    return f'<select id="{select_id}" aria-label="{label}"><option value="">{label}: all</option>{options}</select>'
+
+
+GPU_FILTER_HTML = _gpu_select("gpuNameFilter", "GpuName", "GPU") + _gpu_select("gpuDriverFilter", "GpuDriverVersion", "Driver")
+
+
+def chart_note_html(c):
+    """Short summary under the chart; the long explanation sits behind a native More info toggle."""
+    note, brief = c.get("note"), c.get("brief")
+    if not note and not brief:
+        return ""
+    if not brief:
+        return f"<p class='chart-note'>{note}</p>"
+    more = f"<details class='chart-more'><summary>More info</summary><p class='chart-note'>{note}</p></details>" if note else ""
+    return f"<p class='chart-note'>{brief}</p>{more}"
+
+
 def legend_html(kind):
     if kind == "grade":
         items = GRADE_COLORS.items()
@@ -629,6 +741,8 @@ PERF_CSS = f"""#tab-perf {{
   p.chart-note {{
     color: var(--cp-text-muted); font-size: 12px; margin: 10px 0 0; line-height: 1.5;
   }}
+  details.chart-more {{ margin-top: 6px; }}
+  details.chart-more summary {{ cursor: pointer; color: var(--cp-accent); font-size: 12px; user-select: none; }}
   .filter-bar {{
     margin-bottom: 18px;
   }}
@@ -788,11 +902,13 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       </div>
       <p class="chart-help">Mouse wheel to zoom &middot; drag to pan &middot; both timelines stay in sync</p>
       <div class="drill-canvas"><canvas id="drillTimeline"></canvas></div>
+      <p class="chart-note">Dots are frames held for &ge;1.5 refreshes (amber = doubled, red = 3+); purple marks a present-mode change.</p>
+      <details class="chart-more"><summary>More info</summary>
       <p class="chart-note">Dashed lines mark 1&times;/2&times;/3&times; the display refresh; dots are frames held for &ge;1.5 refreshes
       (amber = doubled, red = 3+ refreshes). Shaded: the warm-up and trimmed tail (not graded) and the worst
       cluster window. Purple triangles/lines mark a present-mode change while graded (rare in steady play; usually an
       overlay, popup or window focus change). Frame time is when the app <i>finished</i> the frame &mdash; if it spikes with displayed time the app was late,
-      if only displayed time spikes the delay happened after the app (compositor/display).</p>
+      if only displayed time spikes the delay happened after the app (compositor/display).</p></details>
     </div>
     <div class="card">
       <div class="chart-header">
@@ -804,9 +920,11 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       </div>
       <p class="chart-help">Red ticks are missed refreshes &mdash; check which line spikes at the same moment</p>
       <div class="drill-canvas short"><canvas id="drillBusy"></canvas></div>
+      <p class="chart-note">Red ticks are missed refreshes. CPU busy can include the app's own limiter wait.</p>
+      <details class="chart-more"><summary>More info</summary>
       <p class="chart-note">CPU busy is the frame time minus the time blocked in the present call, so it includes any time the app
       spends waiting or spinning in its own frame limiter. With frame pacing (common in BGFX VPX) the CPU line sits flat at the
-      refresh interval whether the CPU is idle or flat out, so it does not show how much CPU headroom there is.</p>
+      refresh interval whether the CPU is idle or flat out, so it does not show how much CPU headroom there is.</p></details>
     </div>
     <div class="grid">
       <div class="card">
@@ -822,9 +940,11 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
     <div class="card">
       <div class="chart-header"><h2 id="drillStallsTitle">Stalls</h2></div>
       <div id="drillStalls" class="drill-scroll"></div>
-      <p class="chart-note">&ldquo;Likely cause&rdquo; is a heuristic from the stalled frame and the frame after it: CPU or GPU
-      busy for &ge;1.5 refreshes, a present-mode switch, the app waiting (long frame time but not busy), or otherwise
-      the compositor/display (frame was ready on time but shown late).</p>
+      <p class="chart-note">&ldquo;Likely cause&rdquo; is a heuristic based on the stalled frame and the one after it.</p>
+      <details class="chart-more"><summary>More info</summary>
+      <p class="chart-note">Rules, first match wins: CPU or GPU busy for &ge;1.5 refreshes (GPU also needs the app to be late),
+      a present-mode switch next to the stall, the app waiting (long frame time but not busy), otherwise
+      the compositor/display (frame was ready on time but shown late). These are the same rules VPinPerfMon uses for blame.</p></details>
     </div>
     <div class="card" id="drillModes" hidden></div>
   </div>
@@ -875,6 +995,7 @@ PERF_BODY = f"""<h1>Performance Stats</h1>
       <option value="vr">VR only</option>
     </select>
     {'<details id="emuFilter"><summary id="emuSummary">All emulators</summary><div id="emuPanel"><div class="emu-actions"><button type="button" id="emuAll">All</button><button type="button" id="emuNone">None</button></div><div id="emuList"></div></div></details>' if HAS_EMULATOR else ''}
+    {GPU_FILTER_HTML}
     <details id="tblFilter"><summary id="tblSummary">All tables (no filter)</summary><div id="tblPanel"><div class="emu-actions"><input id="tblSearch" type="text" placeholder="Search tables..."><button type="button" id="tblShown">Select shown</button><button type="button" id="tblClear">Clear</button></div><div id="tblList"></div></div></details>
     <input id="searchBox" type="text" placeholder="...or type part of a table name to highlight">
   </div>
@@ -894,7 +1015,7 @@ PERF_BODY = f"""<h1>Performance Stats</h1>
     <p class="chart-help">{"Hover for details" if c.get("kind") == "gradeBar" else "Mouse wheel to zoom &middot; drag to pan"}</p>
     <canvas id="{c["id"]}"></canvas>
     {legend_html(c.get("legend"))}
-    {f"<p class='chart-note'>{c['note']}</p>" if c.get("note") else ""}
+    {chart_note_html(c)}
   </div>
 ''' for c in chart_defs)}
 </div>
@@ -960,6 +1081,11 @@ const charts = {{}};
 const emuNames = [...new Set(rawRecords.map(row => row.EmuDisplay).filter(name => name != null))].sort();
 const selectedEmus = new Set(emuNames);
 const emuOk = row => row.EmuDisplay == null ? selectedEmus.size === emuNames.length : selectedEmus.has(row.EmuDisplay);
+const gpuNameEl = document.getElementById('gpuNameFilter');
+const gpuDriverEl = document.getElementById('gpuDriverFilter');
+const gpuOk = row => (!gpuNameEl || !gpuNameEl.value || row.GpuName === gpuNameEl.value) &&
+  (!gpuDriverEl || !gpuDriverEl.value || row.GpuDriverVersion === gpuDriverEl.value);
+const drillGpuBands = {json.dumps(list(GPU_LOAD_BANDS))};
 let currentState = null;
 let chartData = {{}};
 let emuChart = null;
@@ -997,6 +1123,11 @@ const pointColor = (def, p) =>
   def.colorBy === 'grade' ? (gradeColors[p.grade] || colors.muted)
   : def.colorBy === 'renderer' ? (rendererColors[p.renderer] || colors.muted)
   : emuColor(p.emu);
+// Points sitting exactly on a 0% or 100% bound (edgeMark charts) get a ring in the theme's text color
+// (near-white on dark, near-black on light) so they stay visible against the axis edge.
+const atBound = (def, p) => !!def.edgeMark && [p.x, p.y].some(v => finite(v) && (v <= 0.05 || v >= 99.95));
+const pointBorder = (def, p) => atBound(def, p) ? colors.text : pointColor(def, p);
+const pointBorderWidth = (def, p) => atBound(def, p) ? 2 : 1;
 // Bubble sizes scale to the 95th percentile so one extreme run can't shrink everyone else to dots.
 const sizeMax = (def, pts) => {{
   if (!def.sizeBy) return 0;
@@ -1095,6 +1226,7 @@ function buildClientState(minRating, startDate, endDate, vrMode, latestOnly) {{
     row.EntryDateDate >= startDate &&
     row.EntryDateDate <= endDate &&
     emuOk(row) &&
+    gpuOk(row) &&
     (vrMode === 'all' || (vrMode === 'vr') === (row.IsVR === 1))
   );
   if (latestOnly) filtered = keepLatestRuns(filtered);
@@ -1113,6 +1245,7 @@ function buildClientState(minRating, startDate, endDate, vrMode, latestOnly) {{
         score: row.StutterGradeScore,
         capped: row.StutterGradeCapped,
         renderer: row.Renderer,
+        legacy: row.BlameLegacy,
         size: def.sizeBy ? row[def.sizeBy] : null,
         date: row.EntryDateTime,
         rid: row._i,
@@ -1341,7 +1474,8 @@ function makeChart(def) {{
         label: def.title,
         data: pts,
         backgroundColor: pts.map(p => pointColor(def, p)),
-        borderColor: pts.map(p => pointColor(def, p)),
+        borderColor: pts.map(p => pointBorder(def, p)),
+        borderWidth: pts.map(p => pointBorderWidth(def, p)),
         pointRadius: pts.map(p => pointRadius(def, p, max)),
         pointStyle: pts.map(p => p.edge != null ? 'triangle' : 'circle'),
         rotation: pts.map(p => p.edge ?? 0),
@@ -1393,6 +1527,7 @@ function makeChart(def) {{
               else if (p.edge != null) lines.push('Off-scale: pinned to the edge (Show all for its real position)');
               if (p.grade) lines.push(`Grade ${{p.grade}} (${{finite(p.score) ? p.score.toFixed(1) : '?'}})${{p.capped === 1 ? ' - capped at C' : ''}}`);
               if (def.colorBy && p.renderer) lines.push(`Renderer: ${{p.renderer}}`);
+              if ((def.x === 'BlameCpuPct' || def.y === 'BlameCpuPct') && p.legacy === 1) lines.push('Legacy blame (older formula, not comparable)');
               if (def.sizeBy && finite(p.size)) lines.push(`Longest stall: ${{p.size.toFixed(1)}} ms`);
               return lines;
             }},
@@ -1677,6 +1812,8 @@ if (emuFilter) {{
   document.addEventListener('click', event => {{ if (!emuFilter.contains(event.target)) emuFilter.open = false; }});
 }}
 vrFilter.addEventListener('change', applyReportFilters);
+if (gpuNameEl) gpuNameEl.addEventListener('change', applyReportFilters);
+if (gpuDriverEl) gpuDriverEl.addEventListener('change', applyReportFilters);
 latestOnlyCheckbox.addEventListener('change', applyReportFilters);
 startDate.addEventListener('change', applyReportFilters);
 endDate.addEventListener('change', applyReportFilters);

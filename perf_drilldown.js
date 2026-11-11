@@ -12,6 +12,7 @@ const DRILL_FALLBACK_CFG = {
   DoubledRefreshes: 1.5, TripleRefreshes: 2.5, BandA: 0.1, BandB: 0.4, BandC: 1, BandD: 3, ZeroScorePct: 10,
   TripleWeight: 3, TripleCapGrade: 'C', TripleCapMinCount: 2, ClusterWindowSec: 5, ClusterWeight: 0.1,
   ClusterMaxExcess: 4, ClusterMinEvents: 3, ClusterMinPeak: 2, MinFrames: 100, TrimEndSeconds: 5,
+  BlameMinStalls: 8, BlameGpuSaturation: 0.9,
 };
 const DRILL_NUM_COLS = ['CPUStartTime', 'FrameTime', 'CPUBusy', 'CPUWait', 'GPUBusy', 'GPUWait', 'DisplayLatency', 'DisplayedTime'];
 
@@ -35,6 +36,12 @@ function drillMedian(values) {
   const s = Float64Array.from(values).sort();
   const h = s.length >> 1;
   return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
+}
+
+function drillPercentile(values, q) {
+  if (!values.length) return NaN;
+  const s = Float64Array.from(values).sort();
+  return s[Math.min(s.length - 1, Math.floor(q * s.length))];
 }
 
 function drillParseCsv(text) {
@@ -170,22 +177,44 @@ function drillLetter(score) {
   return score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
 }
 
-// Heuristic "why" for a miss: look at the stalled frame and the next present of the same swap chain.
-function drillCause(csv, chain, p, refresh) {
-  const at = (arr, q) => (q >= 0 && q < chain.length ? arr[chain[q]] : NaN);
-  const modeAt = q => (q >= 0 && q < chain.length ? csv.mode[chain[q]] : null);
-  const cpu = drillMax(at(csv.CPUBusy, p), at(csv.CPUBusy, p + 1));
-  const gpu = drillMax(at(csv.GPUBusy, p), at(csv.GPUBusy, p + 1));
+// Mirrors VPinPerfMon's stall classifier (BlameVersion 4). `p` is the stalled frame's position in the swap chain;
+// `lo` is the position of the first graded frame (earlier frames are warm-up and are never looked at).
+// A missing value on any frame counts as 0, as in the C# code.
+const DRILL_CAUSES = {
+  cpu: 'CPU', gpu: 'GPU', modeSwitch: 'Present-mode switch', appWait: 'App waiting / OS', display: 'Display / compositor',
+};
+function drillCause(csv, chain, p, refresh, cfg, lo) {
+  const num = x => (Number.isFinite(x) ? x : 0);
+  const at = (arr, q) => (q >= 0 && q < chain.length ? num(arr[chain[q]]) : 0);
+  const modeAt = q => (q >= lo && q < chain.length ? csv.mode[chain[q]] : null);
+  const cpu = Math.max(at(csv.CPUBusy, p), at(csv.CPUBusy, p + 1));
+  const gpu = Math.max(at(csv.GPUBusy, p), at(csv.GPUBusy, p + 1));
   const nextFt = at(csv.FrameTime, p + 1);
-  const mode = modeAt(p);
+  const ft = Math.max(at(csv.FrameTime, p), nextFt);
+  const mode = csv.mode[chain[p]];
   const modeSwitch = [p - 1, p + 1].some(q => modeAt(q) != null && modeAt(q) !== mode);
   const lim = 1.5 * refresh;
-  let cause = 'Display / compositor';
-  if (cpu >= lim && !(gpu > cpu)) cause = 'CPU';
-  else if (gpu >= lim) cause = 'GPU';
-  else if (modeSwitch) cause = 'Present-mode switch';
-  else if (nextFt >= lim) cause = 'App waiting / OS';
-  return { cpu, gpu, nextFt, mode, cause };
+  let key = 'display';
+  if (cpu >= lim && !(gpu > cpu)) key = 'cpu';
+  else if (gpu >= cfg.BlameGpuSaturation * refresh && ft >= lim) key = 'gpu';
+  else if (modeSwitch) key = 'modeSwitch';
+  else if (nextFt >= lim) key = 'appWait';
+  return { cpu, gpu, nextFt, mode, causeKey: key, cause: DRILL_CAUSES[key] };
+}
+
+// Report-side three-way call: is the run limited by the GPU, the CPU, or by something an upgrade won't fix?
+// Needs both facts: stall causes alone or GPU load alone can mislead (high GPU load with CPU-type hitches is common).
+function drillLimiterCall(counts, gpuLoadPct, gpuP99Pct, cfg, bands = [50, 85]) {
+  const total = counts.cpu + counts.gpu + counts.modeSwitch + counts.appWait + counts.display;
+  const detail = `${total} stalls: ${counts.cpu} CPU, ${counts.gpu} GPU, ${total - counts.cpu - counts.gpu} other`;
+  if (total < cfg.BlameMinStalls) return { call: 'unknown', label: 'Too few stalls to call', detail };
+  const hasLoad = Number.isFinite(gpuLoadPct);
+  const level = !hasLoad ? 'unknown' : gpuLoadPct < bands[0] ? 'low' : gpuLoadPct <= bands[1] ? 'moderate' : 'high';
+  // Mostly present-mode switch / display / app-waiting stalls: not fixed by a CPU or GPU upgrade.
+  if (counts.cpu + counts.gpu < total / 2) return { call: 'neither', label: 'Neither (not CPU/GPU-caused)', detail };
+  if (level === 'high' && (counts.gpu > 0 || gpuP99Pct >= 100) && counts.gpu >= counts.cpu) return { call: 'gpu', label: 'GPU-limited', detail };
+  if (level === 'low' && counts.cpu > counts.gpu * 2) return { call: 'cpu', label: 'CPU-limited', detail };
+  return { call: 'unknown', label: 'Unclear', detail };
 }
 
 // Mirrors the VPinPerfMon v2 stutter grade (see DATABASE_COLUMNS.md); rec supplies the stored
@@ -228,6 +257,9 @@ function drillAnalyze(csv, rec, cfgIn, logSec, forceSwap) {
   }
 
   const pos = new Map(chain.map((r, p) => [r, p]));
+  const lo = graded.length ? pos.get(graded[0]) : 0;
+  const stallCounts = { cpu: 0, gpu: 0, modeSwitch: 0, appWait: 0, display: 0 };
+  let cpuMs = 0, gpuMs = 0;
   const winMs = cfg.ClusterWindowSec * 1000;
   const winCounts = new Map();
   const winFrames = new Map();
@@ -243,7 +275,11 @@ function drillAnalyze(csv, rec, cfgIn, logSec, forceSwap) {
       if (isTriple) { triple++; weightedSum += cfg.TripleWeight * (refreshes - 1); } else { doubled++; weightedSum += 1; }
       if (ratio > maxRatio) maxRatio = ratio;
       winCounts.set(w, (winCounts.get(w) || 0) + 1);
-      misses.push({ r, ratio, refreshes, triple: isTriple, win: w, ms: dt[r], ...drillCause(csv, chain, pos.get(r), refresh) });
+      const why = drillCause(csv, chain, pos.get(r), refresh, cfg, lo);
+      stallCounts[why.causeKey]++;
+      if (why.causeKey === 'cpu') cpuMs += dtf(r) - refresh;
+      else if (why.causeKey === 'gpu') gpuMs += dtf(r) - refresh;
+      misses.push({ r, ratio, refreshes, triple: isTriple, win: w, ms: dt[r], ...why });
     }
     cum += dtf(r);
   }
@@ -255,6 +291,16 @@ function drillAnalyze(csv, rec, cfgIn, logSec, forceSwap) {
     if (st[r] >= warmEnd && st[r] < tailStart) modeChanges.push({ r, from: prev, to: csv.mode[r] });
   }
   const missCount = misses.length;
+  // Blame: millisecond-weighted CPU vs GPU share of the app-caused stalls; NULL below BlameMinStalls.
+  let blameCpuPct = null, blameGpuPct = null;
+  if (stallCounts.cpu + stallCounts.gpu >= cfg.BlameMinStalls && cpuMs + gpuMs > 0) {
+    blameCpuPct = 100 * cpuMs / (cpuMs + gpuMs);
+    blameGpuPct = 100 - blameCpuPct;
+  }
+  // GPU load: median GPUBusy of graded frames with GPUBusy > 0, as a percent of the refresh interval.
+  const gpuBusyVals = graded.map(r => csv.GPUBusy[r]).filter(v => v > 0);
+  const gpuLoadPct = gpuBusyVals.length && refresh > 0 ? drillMedian(gpuBusyVals) / refresh * 100 : NaN;
+  const gpuP99Pct = gpuBusyVals.length && refresh > 0 ? drillPercentile(gpuBusyVals, 0.99) / refresh * 100 : NaN;
   const longest = missCount ? drillRound(maxRatio) : 1;
   const weighted = frames ? weightedSum / frames * 100 : 0;
   let peak = 0, peakWin = null;
@@ -275,7 +321,10 @@ function drillAnalyze(csv, rec, cfgIn, logSec, forceSwap) {
     cfg, t0, warmEnd, warmupSec: warmup.sec, warmupSource: warmup.source, swap, swapChains: counts.size, chain, graded, refresh, refreshSource,
     framesAfterWarmup: sel.length, trimmed: valid.length - frames, trimmedSec: trimmedMs / 1000, tailStart,
     frames, missingFrames: sel.length - valid.length, duration,
-    doubled, triple, longest, weighted, misses, modeChanges, peak, peakWin, clusterRatio, multiplier, effective, swapStats: drillSwapStats(csv, warmEnd),
+    doubled, triple, longest, weighted, misses, modeChanges, stallCounts,
+    blameCpuPct, blameGpuPct, gpuLoadPct, gpuP99Pct,
+    limiter: drillLimiterCall(stallCounts, gpuLoadPct, gpuP99Pct, cfg, typeof drillGpuBands !== 'undefined' ? drillGpuBands : undefined),
+    peak, peakWin, clusterRatio, multiplier, effective, swapStats: drillSwapStats(csv, warmEnd),
     score: gradeable ? score : null, capped, grade: gradeable ? drillLetter(score) : null,
     worst: peakFrames ? { from: st[peakFrames[0]], to: st[peakFrames[1]] + dt[peakFrames[1]] } : null,
   };
@@ -581,6 +630,31 @@ function drillLoadChips(rec) {
   ];
 }
 
+// GPU load bands (percent of the refresh interval); the report injects drillGpuBands from GPU_LOAD_BANDS.
+const drillBands = () => (typeof drillGpuBands !== 'undefined' ? drillGpuBands : [50, 85]);
+const drillLoadLabel = pct => (!Number.isFinite(pct) ? '' : pct < drillBands()[0] ? 'headroom' : pct <= drillBands()[1] ? 'moderate' : 'high');
+
+// Lead with GPU load ("is the graphics card the limit?"); blame is secondary and shown with the stall counts behind it.
+function drillBlameChips(res, rec) {
+  const c = res.stallCounts, minStalls = res.cfg.BlameMinStalls;
+  const chips = [];
+  const stored = Number(rec?.GpuBusyPctOfRefresh);
+  const load = Number.isFinite(stored) ? stored : res.gpuLoadPct;
+  if (Number.isFinite(load)) {
+    chips.push([`${load.toFixed(0)}% \u00b7 ${drillLoadLabel(load)}`, 'GPU load (median GPU busy as % of refresh)',
+      `Median GPU busy time per frame as a percent of the refresh interval. Under ${drillBands()[0]}% = headroom, ${drillBands()[0]}-${drillBands()[1]}% = moderate, over ${drillBands()[1]}% = high. Bands are set by GPU_LOAD_BANDS in report_config.py (raise them for VR).`]);
+  }
+  const enough = c.cpu + c.gpu >= minStalls;
+  const legacy = rec && rec.BlameLegacy === 1;
+  const blameText = enough && res.blameCpuPct != null
+    ? `CPU ${res.blameCpuPct.toFixed(0)}% / GPU ${res.blameGpuPct.toFixed(0)}%` : 'not enough app-caused stalls';
+  chips.push([blameText, `blame of ${c.cpu + c.gpu} CPU/GPU stalls (${c.cpu} CPU \u00b7 ${c.gpu} GPU)${legacy ? ' \u00b7 legacy formula in DB' : ''}`,
+    `The CPU-vs-GPU share of the stalls the app itself caused, weighted by milliseconds over the refresh. Present-mode-switch, display/compositor and app-waiting stalls are not blamed on either side. Needs at least ${minStalls} CPU+GPU stalls; otherwise it is not reported.`]);
+  const lim = res.limiter;
+  if (lim && lim.call !== 'unknown') chips.push([lim.label, 'likely limiter', `${lim.detail}. Combines GPU load with the stall causes; a run is not called CPU-bound just because GPU load is low.`]);
+  return chips;
+}
+
 const DRILL_REC_MIN_CHANGES = 4;
 const DRILL_REC_MIN_CPU = 25;
 
@@ -700,6 +774,7 @@ function drillRender(csv, res, rec, file) {
     [`${drillFmt(res.effective, 3)}%`, `effective miss % (cluster ×${drillFmt(res.multiplier, 2)}, peak ${res.peak} per ${res.cfg.ClusterWindowSec} s)`],
     [drillInt(res.modeChanges.length), 'present-mode changes', 'Present-mode changes while graded (after warm-up, before the trimmed tail). Usually caused by an overlay, popup or window focus change.'],
     ...drillLoadChips(rec),
+    ...drillBlameChips(res, rec),
     ...(drillRecordingSuspect(res, rec) ? [['Recording?', 'possible screen-recording session', `Repeated present-mode changes (${res.modeChanges.length}) with high average CPU (${drillFmt(rec.CpuAverage, 1)}%) is the typical signature of a screen recording (for example Popper's record screen) running during the capture, not normal play.`]] : []),
     [escapeHtml(causeText), 'likely stall causes (number of stalls)'],
   ];
@@ -833,16 +908,34 @@ function drillRender(csv, res, rec, file) {
     ['Effective miss %', 'EffectiveMissPct', res.effective, 4, 'rel'],
     ['Grade score', 'StutterGradeScore', res.score, 2, 0.05],
     ['Grade', 'StutterGrade', res.grade, null, 0],
+    ['CPU stalls', 'StallCpuCount', res.stallCounts.cpu, 0, 0],
+    ['GPU stalls', 'StallGpuCount', res.stallCounts.gpu, 0, 0],
+    ['Present-mode switch stalls', 'StallModeSwitchCount', res.stallCounts.modeSwitch, 0, 0],
+    ['App-waiting stalls', 'StallAppWaitCount', res.stallCounts.appWait, 0, 0],
+    ['Display / compositor stalls', 'StallDisplayCount', res.stallCounts.display, 0, 0],
+    ['Blame CPU %', 'BlameCpuPct', res.blameCpuPct, 1, 0.05, true],
+    ['Blame GPU %', 'BlameGpuPct', res.blameGpuPct, 1, 0.05, true],
   ];
+  // Stall counts and blame exist only on rows graded with the stall-based formula; older rows are skipped.
+  const hasStallData = rec != null && rec.StallCpuCount != null;
+  const stallBad = [];
   let ok = 0, compared = 0;
-  const rows = checks.map(([label, key, mine, digits, tol]) => {
+  const rows = checks.map(([label, key, mine, digits, tol, nullable]) => {
+    const isStall = /^(Stall|Blame)/.test(key);
+    if (isStall && !hasStallData) return `<tr><td>${label}</td><td class="num">&ndash;</td><td class="num">${mine == null ? '&ndash;' : drillFmt(Number(mine), digits)}</td><td><span class="muted">&ndash;</span></td></tr>`;
     const db = rec ? rec[key] : null;
     let mark = '<span class="muted">&ndash;</span>';
-    if (db != null && mine != null) {
+    if (nullable) {
+      // NULL blame (too few app-caused stalls) must match NULL, not just numbers.
+      compared++;
+      const pass = (db == null && mine == null) || (db != null && mine != null && Math.abs(mine - db) <= tol + 1e-9);
+      if (pass) ok++; else stallBad.push(label);
+      mark = pass ? '<span class="drill-ok">&#10003;</span>' : '<span class="drill-bad">&#10007;</span>';
+    } else if (db != null && mine != null) {
       compared++;
       const diff = typeof mine === 'number' ? Math.abs(mine - db) : (mine === db ? 0 : 1);
       const pass = tol === 'rel' ? diff <= Math.max(1e-4, Math.abs(db) * 0.01) : diff <= tol + 1e-9;
-      if (pass) ok++;
+      if (pass) ok++; else if (isStall) stallBad.push(label);
       mark = pass ? '<span class="drill-ok">&#10003;</span>' : '<span class="drill-bad">&#10007;</span>';
     }
     const show = v => (v == null ? '&ndash;' : digits == null ? escapeHtml(v) : drillFmt(Number(v), digits));
@@ -851,9 +944,14 @@ function drillRender(csv, res, rec, file) {
   const verdict = !rec ? '<p class="muted">Not linked to a run in this report, so there is nothing to compare against.</p>'
     : ok === compared ? `<p class="drill-ok">All ${compared} values match the database &mdash; this CSV reproduces the stored grade.</p>`
     : `<p class="drill-bad">${compared - ok} of ${compared} values differ &mdash; the grading config, warm-up or file may not match this run.</p>`;
-  drillEl('drillCheck').innerHTML = verdict +
+  const stallWarn = stallBad.length
+    ? `<p class="drill-bad">&#9888; Stall classification differs from the database (${escapeHtml(stallBad.join(', '))}). The warm-up, swap chain or file may not match this run, or the classifier is out of step with VPinPerfMon.</p>` : '';
+  const legacyNote = rec && rec.BlameVersion != null && rec.BlameLegacy === 1
+    ? '<p class="muted">This row uses legacy blame (an older formula), so its stored blame and stall counts are not comparable.</p>' : '';
+  drillEl('drillCheck').innerHTML = verdict + stallWarn + legacyNote +
     `<table class="anomaly-table"><thead><tr><th>Metric</th><th class="num">Database</th><th class="num">From CSV</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>` +
-    `<p class="chart-note">Swap chain ${escapeHtml(res.swap)}${res.swapChains > 1 ? ` (of ${res.swapChains})` : ''} · ${res.trimmed} frames (${res.trimmedSec.toFixed(1)} s) trimmed from the end · ${res.warmupSec} s warm-up (${escapeHtml(res.warmupSource)}${res.warmupSource.startsWith('inferred') ? ', so the frame-count check is not independent' : ''}).</p>`;
+    `<p class="chart-note">Swap chain ${escapeHtml(res.swap)}${res.swapChains > 1 ? ` (of ${res.swapChains})` : ''} · ${res.warmupSec} s warm-up (${escapeHtml(res.warmupSource)}) · ${res.trimmedSec.toFixed(1)} s trimmed from the end.</p>` +
+    `<details class="chart-more"><summary>More info</summary><p class="chart-note">${res.trimmed} frames trimmed from the end${res.warmupSource.startsWith('inferred') ? '; the warm-up was inferred from the frame count, so the frame-count check is not independent' : ''}. Blame needs at least ${res.cfg.BlameMinStalls} CPU+GPU stalls (CfgBlameMinStalls); the GPU rule uses ${drillFmt(res.cfg.BlameGpuSaturation * 100, 0)}% of the refresh (CfgBlameGpuSaturation).</p></details>`;
 
   // ---- present-mode legend (only when the graded window has changes)
   const modeBox = drillEl('drillModes');
@@ -862,8 +960,7 @@ function drillRender(csv, res, rec, file) {
   modeBox.innerHTML = seenModes.length ? '<div class="chart-header"><h2>Present modes in this run</h2></div>' +
     '<table class="anomaly-table"><thead><tr><th>Mode</th><th>What it means</th></tr></thead><tbody>' +
     seenModes.map(m => `<tr><td><code>${escapeHtml(m)}</code></td><td>${escapeHtml(DRILL_MODE_INFO[m] || 'Not described here; see the PresentMon documentation.')}</td></tr>`).join('') +
-    '</tbody></table><p class="chart-note">Rapid back-and-forth switches, sometimes on adjacent frames, usually mean something else is drawing over or interacting with the game window ' +
-    '(overlays, notifications, another app taking focus or topmost status, capture tools). On a pinball cab with several apps driving displays, that is a likely suspect.</p>' : '';
+    '</tbody></table><p class="chart-note">Rapid switches back and forth usually mean something else is drawing over the game window (overlay, notification, another app, capture tool).</p>' : '';
 
   // ---- stall list
   const LIMIT = 200;
