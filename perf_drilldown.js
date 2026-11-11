@@ -80,14 +80,46 @@ function drillParseLog(text) {
   return m ? +m[1] : NaN;
 }
 
-function drillPickSwap(csv, rec, from) {
+function drillPickSwap(csv, rec, from, forceSwap) {
   const counts = new Map();
   for (let r = 0; r < csv.n; r++) if (csv.CPUStartTime[r] >= from) counts.set(csv.swap[r], (counts.get(csv.swap[r]) || 0) + 1);
   if (!counts.size) return { swap: null, counts };
-  const want = String(rec?.SwapChainAddress || '').toLowerCase();
+  const want = String(forceSwap || rec?.SwapChainAddress || '').toLowerCase();
   let swap = [...counts.keys()].find(k => want && k.toLowerCase() === want);
-  if (swap == null) swap = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  if (swap == null) swap = drillLikelyPlayfield(drillSwapStats(csv, from));
   return { swap, counts };
+}
+
+// Chains presented in the same render pass tie on frame count and timing; the playfield is the one doing real GPU work.
+function drillLikelyPlayfield(stats) {
+  const most = Math.max(...stats.map(s => s.frames));
+  const cands = stats.filter(s => s.frames >= most * 0.99);
+  let best = cands[0];
+  for (const s of cands.slice(1)) if (s.gpuMed > best.gpuMed || (!Number.isFinite(best.gpuMed) && Number.isFinite(s.gpuMed))) best = s;
+  return best.swap;
+}
+
+// Per swap chain (after warm-up): frame count, typical refresh, dominant present mode and mode changes.
+// BGFX VPX presents the playfield, DMD and backglass on separate swap chains.
+function drillSwapStats(csv, from) {
+  const by = new Map();
+  for (let r = 0; r < csv.n; r++) {
+    if (!(csv.CPUStartTime[r] >= from)) continue;
+    let s = by.get(csv.swap[r]);
+    if (!s) { s = { swap: csv.swap[r], frames: 0, dts: [], gpus: [], modes: new Map(), changes: 0, prev: null }; by.set(csv.swap[r], s); }
+    s.frames++;
+    if (Number.isFinite(csv.GPUBusy[r])) s.gpus.push(csv.GPUBusy[r]);
+    if (csv.DisplayedTime[r] > 0) s.dts.push(csv.DisplayedTime[r]);
+    const m = csv.mode[r];
+    s.modes.set(m, (s.modes.get(m) || 0) + 1);
+    if (m && s.prev && m !== s.prev) s.changes++;
+    s.prev = m;
+  }
+  return [...by.values()].map(s => {
+    const refreshMs = drillMedian(s.dts);
+    const mode = [...s.modes.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+    return { swap: s.swap, frames: s.frames, refreshMs, hz: 1000 / refreshMs, mode, changes: s.changes, gpuMed: drillMedian(s.gpus) };
+  }).sort((a, b) => b.frames - a.frames);
 }
 
 // Find the whole-second warm-up whose post-warm-up frame count equals the stored PresentMonFrameCount.
@@ -158,7 +190,7 @@ function drillCause(csv, chain, p, refresh) {
 
 // Mirrors the VPinPerfMon v2 stutter grade (see DATABASE_COLUMNS.md); rec supplies the stored
 // swap chain / fixed refresh when available.
-function drillAnalyze(csv, rec, cfgIn, logSec) {
+function drillAnalyze(csv, rec, cfgIn, logSec, forceSwap) {
   const cfg = { ...DRILL_FALLBACK_CFG, ...(cfgIn || {}) };
   const st = csv.CPUStartTime;
   const dt = csv.DisplayedTime;
@@ -167,7 +199,7 @@ function drillAnalyze(csv, rec, cfgIn, logSec) {
   const warmup = drillResolveWarmup(csv, rec, cfg, logSec);
   const warmEnd = t0 + warmup.sec * 1000;
 
-  const { swap, counts } = drillPickSwap(csv, rec, warmEnd);
+  const { swap, counts } = drillPickSwap(csv, rec, warmEnd, forceSwap);
   if (swap == null) throw new Error(`no frames after the ${warmup.sec} s warm-up (${warmup.source})`);
 
   const chain = [];
@@ -215,6 +247,13 @@ function drillAnalyze(csv, rec, cfgIn, logSec) {
     }
     cum += dtf(r);
   }
+  // Present-mode changes inside the graded window only (load / exit switches are excluded).
+  const modeChanges = [];
+  for (let p = 1; p < chain.length; p++) {
+    const r = chain[p], prev = csv.mode[chain[p - 1]];
+    if (!csv.mode[r] || !prev || csv.mode[r] === prev) continue;
+    if (st[r] >= warmEnd && st[r] < tailStart) modeChanges.push({ r, from: prev, to: csv.mode[r] });
+  }
   const missCount = misses.length;
   const longest = missCount ? drillRound(maxRatio) : 1;
   const weighted = frames ? weightedSum / frames * 100 : 0;
@@ -236,7 +275,7 @@ function drillAnalyze(csv, rec, cfgIn, logSec) {
     cfg, t0, warmEnd, warmupSec: warmup.sec, warmupSource: warmup.source, swap, swapChains: counts.size, chain, graded, refresh, refreshSource,
     framesAfterWarmup: sel.length, trimmed: valid.length - frames, trimmedSec: trimmedMs / 1000, tailStart,
     frames, missingFrames: sel.length - valid.length, duration,
-    doubled, triple, longest, weighted, misses, peak, peakWin, clusterRatio, multiplier, effective,
+    doubled, triple, longest, weighted, misses, modeChanges, peak, peakWin, clusterRatio, multiplier, effective, swapStats: drillSwapStats(csv, warmEnd),
     score: gradeable ? score : null, capped, grade: gradeable ? drillLetter(score) : null,
     worst: peakFrames ? { from: st[peakFrames[0]], to: st[peakFrames[1]] + dt[peakFrames[1]] } : null,
   };
@@ -251,6 +290,9 @@ let drillToken = 0;
 let drillSyncing = false;
 let drillFolderLabel = '';
 let drillLast = null;
+let drillCtx = null;
+let drillSwapPick = null;
+let drillUnderlay = true;
 
 function drillStatus(html, kind = '') {
   const el = drillEl('drillStatus');
@@ -359,6 +401,7 @@ async function drillOpenRecord(rid, scroll) {
 
 async function drillLoad(entry, rec) {
   const token = ++drillToken;
+  drillSwapPick = null;
   try {
     const file = entry.getFile ? await entry.getFile() : entry;
     drillStatus(`Reading <code>${escapeHtml(file.name)}</code> (${(file.size / 1048576).toFixed(1)} MB)&hellip;`);
@@ -367,11 +410,23 @@ async function drillLoad(entry, rec) {
     const csv = drillParseCsv(text);
     const logSec = await drillReadLogWarmup(file.name);
     if (token !== drillToken) return;
-    const res = drillAnalyze(csv, rec, rec ? drillCfgs[rec.CfgIdx] : drillCfgs[0], logSec);
+    drillCtx = { csv, rec, file, logSec };
+    const res = drillAnalyze(csv, rec, rec ? drillCfgs[rec.CfgIdx] : drillCfgs[0], logSec, drillSwapPick);
     drillRender(csv, res, rec, file);
   } catch (err) {
     if (token !== drillToken) return;
     drillStatus(`Could not analyze this capture: ${escapeHtml(err.message || err)}`, 'error');
+  }
+}
+
+// Re-run the analysis on the already-loaded CSV after the user picks another swap chain.
+function drillReanalyze() {
+  if (!drillCtx) return;
+  const { csv, rec, file, logSec } = drillCtx;
+  try {
+    drillRender(csv, drillAnalyze(csv, rec, rec ? drillCfgs[rec.CfgIdx] : drillCfgs[0], logSec, drillSwapPick), rec, file);
+  } catch (err) {
+    drillStatus(`Could not analyze this swap chain: ${escapeHtml(err.message || err)}`, 'error');
   }
 }
 
@@ -489,6 +544,52 @@ async function drillOfferReconnect() {
   } catch (err) { /* persistence is optional */ }
 }
 
+const DRILL_MODE_COLOR = '#b07cff';
+const DRILL_MODE_INFO = {
+  'Hardware: Independent Flip': 'Best case: the game owns the screen and flips frames straight to it; Windows is not compositing anything on top.',
+  'Hardware Composed: Independent Flip': 'Also direct: frames go to the screen, but Windows may blend a small overlay (such as a cursor or notification) in hardware without a copy. Same performance class as Independent Flip.',
+  'Hardware: Legacy Flip': 'Older exclusive-fullscreen style flip straight to the display.',
+  'Hardware: Legacy Copy to front buffer': 'Older fullscreen path that copies each frame to the display buffer.',
+  'Composed: Flip': 'The Windows compositor (DWM) takes each frame and blends it with the desktop before display. Slightly more latency and more chance of hitches.',
+  'Composed: Copy with GPU GDI': 'Compositor path where the frame is copied by the GPU (windowed GDI-style apps).',
+  'Composed: Copy with CPU GDI': 'Compositor path where the frame is copied by the CPU; slowest and rare.',
+  'Composed: Composition Atlas': 'Frame is drawn through the compositor into a shared surface (typical of UWP / XAML content).',
+};
+
+// When the game was played: the capture start stamped in the file name (local time) is the most
+// accurate; fall back to the database entry time (end of run), then the file's modified time.
+function drillPlayedAt(file, rec) {
+  const m = /_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:_|\.)/.exec(file?.name || '');
+  if (m) return { text: `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`, note: 'capture start (from file name)' };
+  if (rec?.EntryDateTime) return { text: String(rec.EntryDateTime), note: 'database entry time' };
+  if (file?.lastModified) {
+    const d = new Date(file.lastModified), p = n => String(n).padStart(2, '0');
+    return { text: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`, note: 'file modified time' };
+  }
+  return null;
+}
+
+// Overall CPU / GPU utilization (avg with min / max) from the database record, when present.
+function drillLoadChips(rec) {
+  if (!rec) return [];
+  const pct = v => (v != null && Number.isFinite(Number(v)) ? `${Number(v).toFixed(1)}%` : '&ndash;');
+  const chip = (name, avg, min, max, tip) => (avg != null && Number.isFinite(Number(avg))
+    ? [[`${pct(min)} / ${pct(avg)} / ${pct(max)}`, `${name} (min / avg / max)`, tip]] : []);
+  return [
+    ...chip('CPU', rec.CpuAverage, rec.CpuMin, rec.CpuMax, 'Total processor utilization of the whole machine (not just the game), sampled about once per second.'),
+    ...chip('GPU', rec.GpuAverage, rec.GpuMin, rec.GpuMax, 'Utilization of GPU 0 from NVIDIA NVML, sampled about once per second.'),
+  ];
+}
+
+const DRILL_REC_MIN_CHANGES = 4;
+const DRILL_REC_MIN_CPU = 25;
+
+// Screen-recording sessions (e.g. PinUP Popper "record screen") show repeated present-mode changes plus high CPU.
+function drillRecordingSuspect(res, rec) {
+  const cpu = Number(rec?.CpuAverage);
+  return res.modeChanges.length >= DRILL_REC_MIN_CHANGES && Number.isFinite(cpu) && cpu >= DRILL_REC_MIN_CPU;
+}
+
 const drillBandsPlugin = {
   id: 'drillBands',
   beforeDatasetsDraw(chart, args, opts) {
@@ -509,6 +610,12 @@ const drillBandsPlugin = {
     ctx.strokeStyle = drillAlpha(colors.danger, 0.55);
     ctx.lineWidth = 1;
     (opts.marks || []).forEach(v => {
+      const px = x.getPixelForValue(v);
+      if (px < a.left || px > a.right) return;
+      ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
+    });
+    ctx.strokeStyle = drillAlpha(DRILL_MODE_COLOR, 0.6);
+    (opts.modeMarks || []).forEach(v => {
       const px = x.getPixelForValue(v);
       if (px < a.left || px > a.right) return;
       ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
@@ -580,18 +687,35 @@ function drillRender(csv, res, rec, file) {
   // ---- summary chips
   const causes = {};
   res.misses.forEach(m => { causes[m.cause] = (causes[m.cause] || 0) + 1; });
-  const causeText = Object.entries(causes).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} ${n}`).join(' · ') || 'no stalls';
+  const causeText = Object.entries(causes).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} (${n}x)`).join(' · ') || 'no stalls';
   const worstMiss = res.misses.reduce((w, m) => (!w || m.ratio > w.ratio ? m : w), null);
+  const played = drillPlayedAt(file, rec);
   const chips = [
+    ...(played ? [[escapeHtml(played.text), 'Start Time', `Approximate: ${played.note}`]] : []),
     [`${drillGradeTag(res.grade)} ${drillFmt(res.score, 1)}`, `recomputed grade${rec?.StutterGrade ? ` (DB: ${rec.StutterGrade} ${drillFmt(rec.StutterGradeScore, 1)})` : ''}${res.capped ? ' · capped' : ''}`],
     [drillInt(res.frames), `graded frames · ${drillFmt(res.duration, 1)} s`],
     [`${drillFmt(1000 / refresh, 1)} Hz`, `refresh (${drillFmt(refresh, 3)} ms, ${escapeHtml(res.refreshSource)})`],
     [drillInt(res.misses.length), `missed refreshes (2×: ${res.doubled} · 3×+: ${res.triple})`],
     [worstMiss ? `${drillFmt(worstMiss.ms, 1)} ms` : '&ndash;', worstMiss ? `longest stall (${worstMiss.refreshes} refreshes) at ${drillFmt(sec(st[worstMiss.r]), 1)} s` : 'longest stall'],
     [`${drillFmt(res.effective, 3)}%`, `effective miss % (cluster ×${drillFmt(res.multiplier, 2)}, peak ${res.peak} per ${res.cfg.ClusterWindowSec} s)`],
-    [escapeHtml(causeText), 'likely stall causes'],
+    [drillInt(res.modeChanges.length), 'present-mode changes', 'Present-mode changes while graded (after warm-up, before the trimmed tail). Usually caused by an overlay, popup or window focus change.'],
+    ...drillLoadChips(rec),
+    ...(drillRecordingSuspect(res, rec) ? [['Recording?', 'possible screen-recording session', `Repeated present-mode changes (${res.modeChanges.length}) with high average CPU (${drillFmt(rec.CpuAverage, 1)}%) is the typical signature of a screen recording (for example Popper's record screen) running during the capture, not normal play.`]] : []),
+    [escapeHtml(causeText), 'likely stall causes (number of stalls)'],
   ];
-  drillEl('drillChips').innerHTML = chips.map(([v, l]) => `<div><b>${v}</b>${l}</div>`).join('');
+  drillEl('drillChips').innerHTML = chips.map(([v, l, tip]) => `<div${tip ? ` title="${escapeHtml(tip)}"` : ''}><b>${v}</b>${l}</div>`).join('');
+
+  // ---- swap chain selector + underlay toggle (only when the capture has several chains)
+  const chainBar = drillEl('drillChainBar');
+  chainBar.hidden = res.swapStats.length < 2;
+  if (!chainBar.hidden) {
+    const playfield = drillLikelyPlayfield(res.swapStats);
+    const describe = s => `${s.swap || '(none)'} \u00b7 ${Number.isFinite(s.hz) ? s.hz.toFixed(0) : '?'} Hz \u00b7 ${s.frames.toLocaleString()} frames \u00b7 ${s.mode || '?'}${s.changes ? ` \u00b7 ${s.changes} mode changes` : ''}${s.swap === playfield ? ' \u00b7 likely playfield (highest GPU load)' : ''}`;
+    drillEl('drillChain').innerHTML = res.swapStats.map(s => `<option value="${escapeHtml(s.swap)}"${s.swap === res.swap ? ' selected' : ''}>${escapeHtml(describe(s))}</option>`).join('');
+    drillEl('drillUnderlay').checked = drillUnderlay;
+    const stored = String(rec?.SwapChainAddress || '').toLowerCase();
+    drillEl('drillChainNote').textContent = stored && stored !== res.swap.toLowerCase() ? 'Not the chain VPinPerfMon graded, so the database recheck below will differ.' : '';
+  }
 
   // ---- timeline + CPU/GPU charts (all frames of the graded swap chain, warm-up included)
   const dtData = [], ftData = [], cpuData = [], gpuData = [];
@@ -604,6 +728,19 @@ function drillRender(csv, res, rec, file) {
     if (Number.isFinite(csv.GPUBusy[r])) gpuData.push({ x, y: csv.GPUBusy[r] });
   }
   const xMax = Math.max(1, ...[dtData, ftData, cpuData].map(d => (d.length ? d[d.length - 1].x : 0)));
+  const others = new Map();
+  if (drillUnderlay) {
+    for (let r = 0; r < csv.n; r++) {
+      const s = csv.swap[r], x = sec(st[r]);
+      if (s === res.swap || !Number.isFinite(x) || !Number.isFinite(dt[r])) continue;
+      if (!others.has(s)) others.set(s, []);
+      others.get(s).push({ x, y: dt[r] });
+    }
+  }
+  const underColors = ['#e8a33d', '#c06c84', '#6c9bd2', '#8fbf6a'];
+  const underlays = [...others].map(([s, data], i) => ({ label: `Other chain ${s || '(none)'} (displayed ms)`, data,
+    borderColor: drillAlpha(underColors[i % underColors.length], 0.5), backgroundColor: drillAlpha(underColors[i % underColors.length], 0.5),
+    borderWidth: 1, pointRadius: 0, order: 4 }));
   const missPts = res.misses.map(m => ({ x: sec(st[m.r]), y: m.ms, m }));
   const bands = [{ from: 0, to: res.warmupSec, color: drillAlpha(colors.muted, 0.12), label: 'warm-up (not graded)' }];
   if (Number.isFinite(res.tailStart)) bands.push({ from: sec(res.tailStart), to: xMax, color: drillAlpha(colors.muted, 0.12), label: 'trimmed' });
@@ -612,6 +749,8 @@ function drillRender(csv, res, rec, file) {
                  label: `worst ${res.cfg.ClusterWindowSec} s: ${res.peak} miss${res.peak === 1 ? '' : 'es'}` });
   }
   const marks = missPts.map(p => p.x);
+  const modePts = res.modeChanges.map(c => ({ x: sec(st[c.r]), y: 0, c }));
+  const modeMarks = modePts.map(p => p.x);
   const missLabel = m => [`${m.refreshes}× refresh stall: ${m.ms.toFixed(1)} ms on screen`,
     `CPU busy ${drillFmt(m.cpu, 1)} ms · GPU busy ${drillFmt(m.gpu, 1)} ms`, `Likely: ${m.cause}`];
 
@@ -626,10 +765,13 @@ function drillRender(csv, res, rec, file) {
       { type: 'scatter', label: 'Missed refresh', data: missPts, order: 1, pointRadius: 4, pointHoverRadius: 7,
         backgroundColor: missPts.map(p => (p.m.triple ? colors.danger : colors.warning)),
         borderColor: missPts.map(p => (p.m.triple ? colors.danger : colors.warning)) },
+      { type: 'scatter', label: 'Present-mode change', data: modePts, order: 0, pointStyle: 'triangle', pointRadius: 5, pointHoverRadius: 8,
+        backgroundColor: DRILL_MODE_COLOR, borderColor: DRILL_MODE_COLOR },
+      ...underlays,
     ] },
     options: drillLineOptions('ms', xMax,
-      { bands, lines: [1, 2, 3].map(k => ({ value: k * refresh, label: `${k}× ${(k * refresh).toFixed(1)} ms` })) },
-      item => (item.raw.m ? missLabel(item.raw.m) : `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`)),
+      { bands, modeMarks, lines: [1, 2, 3].map(k => ({ value: k * refresh, label: `${k}× ${(k * refresh).toFixed(1)} ms` })) },
+      item => (item.raw.m ? missLabel(item.raw.m) : item.raw.c ? [`Present mode: ${item.raw.c.from}`, `→ ${item.raw.c.to}`] : `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`)),
   });
 
   drillCharts.busy = new Chart(drillEl('drillBusy'), {
@@ -640,7 +782,7 @@ function drillRender(csv, res, rec, file) {
       { label: 'GPU busy (ms)', data: gpuData, borderColor: colors.accent, backgroundColor: colors.accent, borderWidth: 1, pointRadius: 0 },
     ] },
     options: drillLineOptions('ms', xMax,
-      { bands, marks, lines: [{ value: refresh, label: `1 refresh ${refresh.toFixed(1)} ms` }] },
+      { bands, marks, modeMarks, lines: [{ value: refresh, label: `1 refresh ${refresh.toFixed(1)} ms` }] },
       item => `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`),
   });
 
@@ -713,6 +855,16 @@ function drillRender(csv, res, rec, file) {
     `<table class="anomaly-table"><thead><tr><th>Metric</th><th class="num">Database</th><th class="num">From CSV</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>` +
     `<p class="chart-note">Swap chain ${escapeHtml(res.swap)}${res.swapChains > 1 ? ` (of ${res.swapChains})` : ''} · ${res.trimmed} frames (${res.trimmedSec.toFixed(1)} s) trimmed from the end · ${res.warmupSec} s warm-up (${escapeHtml(res.warmupSource)}${res.warmupSource.startsWith('inferred') ? ', so the frame-count check is not independent' : ''}).</p>`;
 
+  // ---- present-mode legend (only when the graded window has changes)
+  const modeBox = drillEl('drillModes');
+  const seenModes = [...new Set(res.modeChanges.flatMap(c => [c.from, c.to]))];
+  modeBox.hidden = !seenModes.length;
+  modeBox.innerHTML = seenModes.length ? '<div class="chart-header"><h2>Present modes in this run</h2></div>' +
+    '<table class="anomaly-table"><thead><tr><th>Mode</th><th>What it means</th></tr></thead><tbody>' +
+    seenModes.map(m => `<tr><td><code>${escapeHtml(m)}</code></td><td>${escapeHtml(DRILL_MODE_INFO[m] || 'Not described here; see the PresentMon documentation.')}</td></tr>`).join('') +
+    '</tbody></table><p class="chart-note">Rapid back-and-forth switches, sometimes on adjacent frames, usually mean something else is drawing over or interacting with the game window ' +
+    '(overlays, notifications, another app taking focus or topmost status, capture tools). On a pinball cab with several apps driving displays, that is a likely suspect.</p>' : '';
+
   // ---- stall list
   const LIMIT = 200;
   const stalls = res.misses.slice().sort((a, b) => b.ratio - a.ratio || a.r - b.r).slice(0, LIMIT).sort((a, b) => a.r - b.r);
@@ -736,6 +888,14 @@ function drillRender(csv, res, rec, file) {
 drillEl('drillRun').addEventListener('change', e => {
   if (e.target.value === '') return;
   drillOpenRecord(Number(e.target.value), false);
+});
+drillEl('drillChain').addEventListener('change', e => {
+  drillSwapPick = e.target.value;
+  drillReanalyze();
+});
+drillEl('drillUnderlay').addEventListener('change', e => {
+  drillUnderlay = e.target.checked;
+  if (drillLast) drillRender(drillLast.csv, drillLast.res, drillLast.rec, drillLast.file);
 });
 drillEl('drillFolderBtn').addEventListener('click', drillConnectFolder);
 drillEl('drillFileBtn').addEventListener('click', () => drillEl('drillFileInput').click());

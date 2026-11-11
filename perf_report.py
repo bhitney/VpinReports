@@ -78,6 +78,7 @@ if HAS_GRADE:
     cols += [c for c in GRADE_COLS if c in df.columns]
 if HAS_EMULATOR:
     cols.append("EmuDisplay")
+cols += [c for c in ("CpuMin", "CpuMax", "GpuMin", "GpuMax") if c in df.columns]
 if HAS_GAME_RATING:
     cols.append("GameRating")
 HAS_GAME_ID = "GameID" in df.columns
@@ -286,7 +287,8 @@ chart_defs = [
             "Based only on the worst (bottom) 1% of frames in the capture, split between CPU-side and "
             "GPU-side cause &mdash; the two always add up to 100%. High Blame GPU% means the GPU is the "
             "limiting factor on the capture's worst frames; high Blame CPU% points at the CPU/driver side "
-            "instead."
+            "instead. Caveat: frame pacing breaks this attribution. A paced app's CPU busy time includes its own "
+            "limiter wait, so CPU blame reads very high even when the CPU is not the real limit (common with BGFX VPX)."
         ),
     },
     {
@@ -723,6 +725,8 @@ PERF_CSS += """#tab-perf {
   .drill-hint button { font: inherit; font-size: 11px; padding: 1px 8px; margin: 0 4px; cursor: pointer; border-radius: 6px;
                        border: 1px solid var(--cp-border); background: var(--cp-surface-soft); color: var(--cp-text); }
   .drill-hint button:hover { border-color: var(--cp-accent); color: var(--cp-accent); }
+  .drill-chain { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin: 10px 0; font-size: 13px; color: var(--cp-text-muted); }
+  .drill-chain select { max-width: 640px; padding: 4px 8px; border-radius: 0.5rem; border: 1px solid var(--cp-border); background: var(--cp-surface-soft); color: var(--cp-text); }
   .drill-status { font-size: 13px; color: var(--cp-text-muted); margin: 10px 0 4px; min-height: 18px; }
   .drill-status.warn { color: var(--cp-warning); }
   .drill-status.error { color: var(--cp-danger); }
@@ -769,6 +773,11 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
   <div id="drillResults" hidden>
     <h3 id="drillTitle"></h3>
     <div id="drillChips" class="summary"></div>
+    <div id="drillChainBar" class="drill-chain" hidden>
+      <label>Swap chain <select id="drillChain"></select></label>
+      <label><input type="checkbox" id="drillUnderlay" checked> Show other chains on the timeline (faint)</label>
+      <span id="drillChainNote" class="muted"></span>
+    </div>
     <div class="card">
       <div class="chart-header">
         <h2>Frame timeline &mdash; how long each frame stayed on screen</h2>
@@ -781,7 +790,8 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       <div class="drill-canvas"><canvas id="drillTimeline"></canvas></div>
       <p class="chart-note">Dashed lines mark 1&times;/2&times;/3&times; the display refresh; dots are frames held for &ge;1.5 refreshes
       (amber = doubled, red = 3+ refreshes). Shaded: the warm-up and trimmed tail (not graded) and the worst
-      cluster window. Frame time is when the app <i>finished</i> the frame &mdash; if it spikes with displayed time the app was late,
+      cluster window. Purple triangles/lines mark a present-mode change while graded (rare in steady play; usually an
+      overlay, popup or window focus change). Frame time is when the app <i>finished</i> the frame &mdash; if it spikes with displayed time the app was late,
       if only displayed time spikes the delay happened after the app (compositor/display).</p>
     </div>
     <div class="card">
@@ -794,6 +804,9 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       </div>
       <p class="chart-help">Red ticks are missed refreshes &mdash; check which line spikes at the same moment</p>
       <div class="drill-canvas short"><canvas id="drillBusy"></canvas></div>
+      <p class="chart-note">CPU busy is the frame time minus the time blocked in the present call, so it includes any time the app
+      spends waiting or spinning in its own frame limiter. With frame pacing (common in BGFX VPX) the CPU line sits flat at the
+      refresh interval whether the CPU is idle or flat out, so it does not show how much CPU headroom there is.</p>
     </div>
     <div class="grid">
       <div class="card">
@@ -813,6 +826,7 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       busy for &ge;1.5 refreshes, a present-mode switch, the app waiting (long frame time but not busy), or otherwise
       the compositor/display (frame was ready on time but shown late).</p>
     </div>
+    <div class="card" id="drillModes" hidden></div>
   </div>
 </div>
 """
