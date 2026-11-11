@@ -777,11 +777,13 @@ function drillRender(csv, res, rec, file) {
   const sec = ms => (ms - res.t0) / 1000;
   const refresh = res.refresh;
 
-  const when = drillWhen(file, rec, res.t0 != null ? (st[res.chain[res.chain.length - 1]] - res.t0) / 1000 : NaN);
-  const whenHtml = when ? ` <span class="drill-when" title="${escapeHtml(when.tip)}">${escapeHtml(when.text)}</span>` : '';
+  const spanSec = res.t0 != null ? (st[res.chain[res.chain.length - 1]] - res.t0) / 1000 : NaN;
+  const when = drillWhen(file, rec, spanSec);
+  const played = drillPlayedAt(file, rec);
+  const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   drillEl('drillTitle').innerHTML = rec
-    ? `${escapeHtml(rec.Table)}${whenHtml} <span class="muted">&middot; ${escapeHtml(rec.EmuDisplay ?? '')} &middot; <code>${escapeHtml(file.name)}</code></span>`
-    : `<code>${escapeHtml(file.name)}</code>${whenHtml} <span class="muted">&middot; not in this report &mdash; standalone analysis</span>`;
+    ? `${escapeHtml(rec.Table)} <span class="muted">&middot; ${escapeHtml(rec.EmuDisplay ?? '')} &middot; <code>${escapeHtml(file.name)}</code></span>`
+    : `<code>${escapeHtml(file.name)}</code> <span class="muted">&middot; not in this report &mdash; standalone analysis</span>`;
 
   // ---- summary tiles, grouped by the question they answer
   const causes = {};
@@ -794,6 +796,8 @@ function drillRender(csv, res, rec, file) {
     { title: 'Run', tiles: [
       [drillInt(res.frames), `graded frames · ${drillFmt(res.duration, 1)} s`],
       [`${drillFmt(1000 / refresh, 1)} Hz`, `refresh (${drillFmt(refresh, 3)} ms, ${escapeHtml(res.refreshSource)})`],
+      ...(played ? [[escapeHtml(played.text), 'start time', when ? when.tip : played.note]] : []),
+      ...(Number.isFinite(spanSec) ? [[mmss(spanSec), `duration (${drillFmt(spanSec, 1)} s capture)`]] : []),
     ] },
     { title: 'Smoothness', tiles: [
       [`${drillGradeTag(res.grade)} ${drillFmt(res.score, 1)}`, `recomputed grade${rec?.StutterGrade ? ` (DB: ${rec.StutterGrade} ${drillFmt(rec.StutterGradeScore, 1)})` : ''}${res.capped ? ' · capped' : ''}`],
