@@ -912,11 +912,11 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       </div>
       <p class="chart-help">Mouse wheel to zoom &middot; drag to pan &middot; both timelines stay in sync</p>
       <div class="drill-canvas"><canvas id="drillTimeline"></canvas></div>
-      <p class="chart-note">Dots are frames held for &ge;1.5 refreshes (amber = doubled, red = 3+); purple marks a present-mode change.</p>
+      <p class="chart-note">Dots are frames held for &ge;1.5 refreshes (amber = doubled, red = 3+); magenta marks a present-mode change and violet a user flag.</p>
       <details class="chart-more"><summary>More info</summary>
       <p class="chart-note">Dashed lines mark 1&times;/2&times;/3&times; the display refresh; dots are frames held for &ge;1.5 refreshes
       (amber = doubled, red = 3+ refreshes). Shaded: the warm-up and trimmed tail (not graded) and the worst
-      cluster window. Purple triangles/lines mark a present-mode change while graded (rare in steady play; usually an
+      cluster window. Magenta triangles/lines mark a present-mode change while graded (rare in steady play; usually an
       overlay, popup or window focus change). Frame time is when the app <i>finished</i> the frame &mdash; if it spikes with displayed time the app was late,
       if only displayed time spikes the delay happened after the app (compositor/display).</p></details>
     </div>

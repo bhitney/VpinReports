@@ -192,6 +192,14 @@ function drillSysSeries(sys, csv, res) {
   };
 }
 
+// User flags (SendUserFlag.exe -> UserFlag rows in SysEvents) as x positions on the same axis as drillSysSeries.
+function drillFlagMarks(sys, csv, res) {
+  if (!sys || !sys.events || !csv || csv.timeBase !== 'qpc' || !Number.isFinite(res?.t0)) return [];
+  const e = sys.events, out = [];
+  for (let i = 0; i < e.n; i++) if (e.Event[i] === 'UserFlag' && Number.isFinite(e.QpcMs[i])) out.push((e.QpcMs[i] - res.t0) / 1000);
+  return out;
+}
+
 // The sampler second that covers time `t` (seconds since the first frame): the first sample stamped at or after t,
 // because each sample averages the second before its stamp. Returns the row index, or -1 when t is outside the data.
 function drillSysTickAt(series, t) {
@@ -828,7 +836,10 @@ async function drillOfferReconnect() {
   } catch (err) { /* persistence is optional */ }
 }
 
-const DRILL_MODE_COLOR = '#b07cff';
+const DRILL_MODE_COLOR = '#f050f8';
+const DRILL_FLAG_COLOR = '#b07cff';
+// Legend-only entry for the vertical user-flag lines (SendUserFlag.exe); nothing when the run has no flags.
+const drillFlagLegend = flagMarks => (flagMarks.length ? [{ label: 'User flag', data: [], borderColor: DRILL_FLAG_COLOR, backgroundColor: DRILL_FLAG_COLOR, borderWidth: 2, pointRadius: 0 }] : []);
 const DRILL_MODE_INFO = {
   'Hardware: Independent Flip': 'The game has the screen to itself. Frames go straight to the display with no Windows compositing.',
   'Hardware Composed: Independent Flip': 'Frames still go straight to the display, but Windows is blending a small overlay (such as a cursor or notification) in hardware, without copying the frame. Performance is essentially the same as plain Independent Flip.',
@@ -952,6 +963,14 @@ const drillBandsPlugin = {
       if (px < a.left || px > a.right) return;
       ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
     });
+    ctx.strokeStyle = drillAlpha(DRILL_FLAG_COLOR, 0.9);
+    ctx.lineWidth = 2;
+    (opts.flagMarks || []).forEach(v => {
+      const px = x.getPixelForValue(v);
+      if (px < a.left || px > a.right) return;
+      ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
+    });
+    ctx.lineWidth = 1;
     ctx.setLineDash([4, 4]);
     (opts.lines || []).forEach(l => {
       const py = y.getPixelForValue(l.value);
@@ -1009,7 +1028,7 @@ function drillLineOptions(ylabel, xMax, overlay, tooltipLabel) {
 
 // ---- system load lane: whole-machine CPU / busiest core / GPU from the sampler, on the frame timeline's x axis ----
 // Hidden when the run has no sampler data (older runs, --sysstats false, or sampler files not connected).
-function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax) {
+function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax, flagMarks) {
   const card = drillEl('drillSysCard');
   const series = drillSysSeries(sys, csv, res);
   if (!series) {
@@ -1026,9 +1045,10 @@ function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax) {
       line('CPU, whole machine (%)', series.cpu, colors.warning, 1.5),
       line('CPU, busiest core (%)', series.core, drillAlpha(colors.warning, 0.45), 1),
       line('GPU, busiest engine (%)', series.gpu, colors.accent, 1.5),
+      ...drillFlagLegend(flagMarks),
     ] },
     options: (() => {
-      const o = drillLineOptions('%', xMax, { bands, marks, modeMarks }, item => `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`);
+      const o = drillLineOptions('%', xMax, { bands, marks, modeMarks, flagMarks }, item => `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`);
       o.scales.y.max = 100;
       if (sys.procs) o.plugins.tooltip.callbacks.afterBody = items => {
         const procs = drillSysProcsAt(sys, items[0]?.raw?.i);
@@ -1089,7 +1109,8 @@ function drillRenderProc() {
     if (ps.rest) sets.push({ label: view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
       borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
   }
-  const o = drillLineOptions(view.unit, ctx.xMax, { bands: ctx.bands, marks: ctx.marks, modeMarks: ctx.modeMarks },
+  sets.push(...drillFlagLegend(ctx.flagMarks));
+  const o = drillLineOptions(view.unit, ctx.xMax,
     item => `${item.dataset.label}: ${item.parsed.y.toFixed(view.unit === '%' ? 1 : view.unit === 'MB/s' ? 2 : 0)} ${view.unit}`);
   o.plugins.decimation = { enabled: false };
   o.interaction = { mode: 'index', axis: 'x', intersect: false };
@@ -1197,6 +1218,7 @@ function drillRender(csv, res, rec, file, sys) {
   const marks = missPts.map(p => p.x);
   const modePts = res.modeChanges.map(c => ({ x: sec(st[c.r]), y: 0, c }));
   const modeMarks = modePts.map(p => p.x);
+  const flagMarks = drillFlagMarks(sys, csv, res);
   const missLabel = m => [`${m.refreshes}× refresh stall: ${m.ms.toFixed(1)} ms on screen`,
     `CPU busy ${drillFmt(m.cpu, 1)} ms · GPU busy ${drillFmt(m.gpu, 1)} ms`, `Likely: ${m.cause}`];
 
@@ -1213,11 +1235,13 @@ function drillRender(csv, res, rec, file, sys) {
         borderColor: missPts.map(p => (p.m.triple ? colors.danger : colors.warning)) },
       { type: 'scatter', label: 'Present-mode change', data: modePts, order: 0, pointStyle: 'triangle', pointRadius: 5, pointHoverRadius: 8,
         backgroundColor: DRILL_MODE_COLOR, borderColor: DRILL_MODE_COLOR },
+      ...(flagMarks.length ? [{ type: 'scatter', label: 'User flag', data: flagMarks.map(x => ({ x, y: 0, flag: true })), order: 0, pointStyle: 'rectRot', pointRadius: 6, pointHoverRadius: 9,
+        backgroundColor: DRILL_FLAG_COLOR, borderColor: DRILL_FLAG_COLOR }] : []),
       ...underlays,
     ] },
     options: drillLineOptions('ms', xMax,
-      { bands, modeMarks, lines: [1, 2, 3].map(k => ({ value: k * refresh, label: `${k}× ${(k * refresh).toFixed(1)} ms` })) },
-      item => (item.raw.m ? missLabel(item.raw.m) : item.raw.c ? [`Present mode: ${item.raw.c.from}`, `→ ${item.raw.c.to}`] : `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`)),
+      { bands, modeMarks, flagMarks, lines: [1, 2, 3].map(k => ({ value: k * refresh, label: `${k}× ${(k * refresh).toFixed(1)} ms` })) },
+      item => (item.raw.flag ? 'User flag' : item.raw.m ? missLabel(item.raw.m) : item.raw.c ? [`Present mode: ${item.raw.c.from}`, `→ ${item.raw.c.to}`] : `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`)),
   });
 
   drillCharts.busy = new Chart(drillEl('drillBusy'), {
@@ -1226,14 +1250,15 @@ function drillRender(csv, res, rec, file, sys) {
     data: { datasets: [
       { label: 'CPU busy (ms)', data: cpuData, borderColor: colors.warning, backgroundColor: colors.warning, borderWidth: 1, pointRadius: 0 },
       { label: 'GPU busy (ms)', data: gpuData, borderColor: colors.accent, backgroundColor: colors.accent, borderWidth: 1, pointRadius: 0 },
+      ...drillFlagLegend(flagMarks),
     ] },
     options: drillLineOptions('ms', xMax,
-      { bands, marks, modeMarks, lines: [{ value: refresh, label: `1 refresh ${refresh.toFixed(1)} ms` }] },
+      { bands, marks, modeMarks, flagMarks, lines: [{ value: refresh, label: `1 refresh ${refresh.toFixed(1)} ms` }] },
       item => `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`),
   });
 
-  drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax);
-  drillProcCtx = { sys, csv, res, bands, marks, modeMarks, xMax };
+  drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax, flagMarks);
+  drillProcCtx = { sys, csv, res, bands, marks, modeMarks, xMax, flagMarks };
   drillRenderProc();
 
   // ---- histogram of on-screen time in refreshes
