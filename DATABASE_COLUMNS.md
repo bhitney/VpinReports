@@ -22,14 +22,20 @@ One row is written per capture (one table, one play session, one `VPinPerfMon.ex
 | `IsVR` | `1` for a VR capture, `0` for desktop. VR and desktop runs should normally be charted separately. |
 | `SourceFile` | Table file name given to the tool (for example `Game of Thrones LE (Stern 2015).vpx`). Fallback for matching when `GameId` is unknown. |
 | `EntryDate` | When the row was written, in UTC. |
-| `SampleCount` | Number of CPU/GPU samples taken, about one per second after warm-up. |
+| `SampleCount` | Number of CPU/GPU samples used for the `Cpu*`, `Gpu*` and `GpuMemory*` columns: about one per second after the warm-up, minus the last `CfgTrimEndSeconds` samples (the exit tail). Rows captured before the tail trim was added include those last seconds, so they are not exactly comparable. |
 | `PresentMonFrameCount` | Number of rendered frames analysed from PresentMon, after the warm-up period and for the selected swap chain only. Use this as the run's frame count. It includes the last few seconds that the grade excludes, so it is slightly larger than `GradeFrames`. |
 | `SwapChainAddress` | Address of the swap chain that was analysed (the playfield). Informational. |
 | `SwapChainCount` | How many swap chains were present in the capture. More than 1 means the tool had to choose (the one with the most frames). Values above 1 mark captures where the selection mattered. |
-| `PresentApplication` | The executable that owns the analysed swap chain, for example `VPinballX64.exe` (VPX 10.8) or `VPinballX_BGFX64.exe` (BGFX). Useful for splitting renderers. |
+Useful for splitting renderers. |
 | `PresentMode` | How frames reach the display, for example `Hardware: Independent Flip`, `Hardware Composed: Independent Flip` or `Composed: Flip`. Independent flip is the lowest-overhead mode. The most common value for the chain is stored. |
+| `GpuName` |
+| `GpuDriverVersion` | NVIDIA driver version at capture time (or the `--gpu_driver` value for backfilled rows). NULL when NVML was unavailable. |
+| `CaptureAnchorUtc` | ISO 8601 UTC time taken just before PresentMon was launched, for example `2026-11-12T14:31:30.1234567Z`. NULL on rows captured before migration 006. Together with `CaptureAnchorQpcMs` it ties a frame's QPC time to wall-clock time. |
+| `CaptureAnchorQpcMs` | The QPC clock in milliseconds, read at the same instant as `CaptureAnchorUtc`. It restarts at reboot, so use it only with the `CaptureAnchorUtc` of the same row. A frame's UTC time is `CaptureAnchorUtc + (CPUStartQPCTime - CaptureAnchorQpcMs)` ms. |
+| `TimeBase` | Which time column the PresentMon CSV carries: `relative` (`CPUStartTime`, ms since the trace started) or `qpc` (`CPUStartQPCTime`, absolute QPC ms). NULL means an old row, treat it as `relative`. |
 | `FileAnalysisPath` | Absolute path to the text log of the run. May no longer exist if logs were cleaned up. |
-| `FileRawDataPath` | Absolute path to the PresentMon CSV of the run. `NULL` when the CSV was deleted at run time. May no longer exist. |
+| `FileRawDataPath` |
+| `FileAssetStem` | The part of the file names that is the same for every file of the run, for example `20261112133050_Blue Note (Gottlieb 1979)`. It has no folder and no extension, so it works on any device: look in your own copy of the log folder (and its archive) for `<Prefix>_<FileAssetStem>.<extension>`. The files are `PresentMon_<stem>.csv` (frame data), `PresentMon_<stem>.txt` (console log), `SysStats_<stem>.csv`, `SysProcs_<stem>.csv` and `SysEvents_<stem>.csv` (system sampler, newer runs only). Treat it as a plain string, not a glob: game names can contain `[ ] * ?`. Match with the prefix and extension rather than `*_<stem>.*`, because a stem can be the tail of a longer one. Which files exist depends on the run (`--deletecsv true` or `--sysstats false` leave some out). Older rows were filled in from `FileRawDataPath` by migration 007. `NULL` means the stem is not known. |
 
 ## Stutter grade (recommended measure)
 
@@ -60,7 +66,13 @@ The grade counts **missed refreshes**: frames that stayed on screen for more tha
 
 `CfgDoubledRefreshes`, `CfgTripleRefreshes`, `CfgBandA`, `CfgBandB`, `CfgBandC`, `CfgBandD`, `CfgZeroScorePct`, `CfgTripleWeight`, `CfgTripleCapGrade`, `CfgTripleCapMinCount`, `CfgTrimStartSeconds`, `CfgTrimEndSeconds`, `CfgClusterWindowSec`, `CfgClusterWeight`, `CfgClusterMaxExcess`, `CfgClusterMinEvents`, `CfgClusterMinPeak`, `CfgMinFrames`, `CfgBlameMinStalls`, `CfgBlameGpuSaturation`.
 
-These store the thresholds the row was graded with. They are constants unless the tool was run with non-default settings or the rules were retuned, so they are rarely worth charting. Use them to check that two rows were graded the same way before comparing them. The values at the time of writing are 1.5 refreshes (doubled), 2.5 (3+), bands 0.1 / 0.4 / 1 / 3, weight 3, cap at C when 2 or more 3+ frames, warm-up skipped (`CfgTrimStartSeconds`, the launcher's `--delaystart`: usually 30 s, longer for some launchers/emulators), 5 s tail dropped, 5 s windows, and a 100 frame minimum.
+These store the thresholds the row was graded with. Most are constants unless the tool was run with non-default settings or the rules were retuned, so they are rarely worth charting. Use them to check that two rows were graded the same way before comparing them. The values at the time of writing are 1.5 refreshes (doubled), 2.5 (3+), bands 0.1 / 0.4 / 1 / 3, weight 3, cap at C when 2 or more 3+ frames, 5 s tail dropped, 5 s windows, and a 100 frame minimum.
+
+**Trimmed time at the start and end of a capture.**
+- `CfgTrimStartSeconds` is the warm-up: seconds ignored at the start of the capture. It is the value passed as `--delaystart` (often 30, but it varies by launch script). PresentMon records from the start, and the tool then discards the frames in this window before computing any statistic. It applies to every frame-based column in the row (`PresentMonFrameCount`, FPS, frame time, displayed time, busy and wait, and the grade), so it explains why `PresentMonFrameCount` is smaller than the frames PresentMon actually recorded. The CPU and GPU utilization columns (`CpuAverage`, `GpuAverage` and their min and max) skip the same period as a sample count (`SampleCount`) but are timed by the tool's own clock, not PresentMon's.
+- `CfgTrimEndSeconds` is the tail dropped from the end of the capture, and only for the grade (the game may have exited before the trace finished). It does not affect the other frame statistics.
+- `NULL` in `CfgTrimStartSeconds` means the row predates the column, or it was regraded from a log that did not record the warm-up. Do not assume 30.
+- Runs with different warm-up lengths cover different parts of a table's session (a longer warm-up skips more of the start). Check this column before comparing runs, for example when you compare fresh-start behaviour.
 
 ### Present gap diagnostics (informational)
 

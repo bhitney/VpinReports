@@ -11,8 +11,8 @@ const played = source.slice(source.indexOf('function drillPlayedAt('), source.in
 const context = vm.createContext({ escapeHtml: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;') });
 vm.runInContext(core + played, context);
 const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup,
-  drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt, drillSysProcsAt, drillProcText } = vm.runInContext(
-  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup, drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt, drillSysProcsAt, drillProcText })', context);
+  drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt, drillSysProcsAt, drillProcText, drillJitter, drillJitterTile } = vm.runInContext(
+  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup, drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt, drillSysProcsAt, drillProcText, drillJitter, drillJitterTile })', context);
 
 // 10 s at 10 ms per frame: warm-up 2 s, tail trim 1 s (graded window 2 s .. 9 s).
 function buildCsv(modeAt) {
@@ -399,4 +399,38 @@ test('busiest processes for a sampler second, highest load first, with a readabl
   assert.equal(drillSysProcsAt(sys, -1).length, 0);
   assert.equal(drillSysProcsAt(drillParseSys({ stats: 'QpcMs,CpuTotalPct\n1,1' }), 0).length, 0);
   assert.equal(drillSysProcsAt(null, 0).length, 0);
+});
+
+function jitterInput(frameAt, shownAt, n = 1000, refresh = 7.246) {
+  const FrameTime = new Float64Array(n), DisplayedTime = new Float64Array(n);
+  for (let i = 0; i < n; i++) { FrameTime[i] = frameAt(i); DisplayedTime[i] = shownAt(i); }
+  return { csv: { FrameTime, DisplayedTime }, res: { graded: Array.from({ length: n }, (_, i) => i), refresh } };
+}
+
+test('a limiter zigzag (late frame, early frame) with steady on-screen time reads as jitter, not judder', () => {
+  const { csv, res } = jitterInput(i => 7.246 + (i % 2 ? 0.6 : -0.6), () => 7.246);
+  const j = drillJitter(csv, res);
+  assert.ok(Math.abs(j.frameSd - 0.6) < 0.01);
+  assert.ok(j.alternating < -0.95);
+  assert.ok(j.displayedSd < 0.001);
+  const tile = drillJitterTile(j, res.refresh)[0];
+  assert.match(tile[0], /^±0\.60 ms$/);
+  assert.match(tile[1], /zigzag, on-screen time steady/);
+  assert.equal(tile[3], undefined);
+});
+
+test('uneven on-screen time is flagged, and stalls do not count toward jitter', () => {
+  const { csv, res } = jitterInput(() => 7.246, i => (i % 2 ? 7.9 : 6.6));
+  const tile = drillJitterTile(drillJitter(csv, res), res.refresh)[0];
+  assert.match(tile[1], /on-screen time varies/);
+  assert.equal(tile[3], 'warn');
+  const withStall = jitterInput(i => (i === 500 ? 14.5 : 7.246), i => (i === 500 ? 14.5 : 7.246));
+  assert.ok(drillJitter(withStall.csv, withStall.res).frameSd < 1e-9);
+});
+
+test('too few frames, or no refresh, gives no jitter tile', () => {
+  const small = jitterInput(() => 7.2, () => 7.2, 50);
+  assert.equal(drillJitter(small.csv, small.res), null);
+  assert.equal(drillJitter(null, null), null);
+  assert.equal(drillJitterTile(null, 7.2).length, 0);
 });

@@ -497,6 +497,49 @@ function drillAnalyze(csv, rec, cfgIn, logSec, forceSwap) {
     worst: peakFrames ? { from: st[peakFrames[0]], to: st[peakFrames[1]] + dt[peakFrames[1]] } : null,
   };
 }
+
+// Frame-time jitter of the graded frames: how far the gap between Present calls wanders around its mean, next to how
+// steady the on-screen time is. Stalls (a frame held 1.5+ refreshes) are left out so one hitch does not hide the rhythm.
+// `alternating` is the lag-1 autocorrelation of frame time: strongly negative means a late frame is followed by an early
+// one (the zigzag of a frame limiter or vsync wait), which averages out and is not judder. Null when there are too few frames.
+function drillJitter(csv, res) {
+  if (!res || !res.graded || !(res.refresh > 0)) return null;
+  const ft = [], dt = [];
+  for (const r of res.graded) {
+    const f = csv.FrameTime[r], d = csv.DisplayedTime[r];
+    if (!Number.isFinite(f) || !Number.isFinite(d) || f <= 0 || d <= 0 || d >= 1.5 * res.refresh || f >= 1.5 * res.refresh) continue;
+    ft.push(f); dt.push(d);
+  }
+  if (ft.length < 200) return null;
+  const stats = a => {
+    const m = a.reduce((s, v) => s + v, 0) / a.length;
+    let ss = 0;
+    for (const v of a) ss += (v - m) * (v - m);
+    return { mean: m, sd: Math.sqrt(ss / a.length), ss };
+  };
+  const f = stats(ft), d = stats(dt);
+  let num = 0;
+  for (let i = 1; i < ft.length; i++) num += (ft[i] - f.mean) * (ft[i - 1] - f.mean);
+  const alternating = f.ss > 0 ? num / f.ss : 0;
+  const sorted = ft.map(v => Math.abs(v - f.mean)).sort((a, b) => a - b);
+  const p99 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.99))];
+  return { n: ft.length, frameMean: f.mean, frameSd: f.sd, frameP99Dev: p99, displayedSd: d.sd, alternating };
+}
+
+// Tile list for drillJitter (empty when there is nothing to say). Not a grade input: it only explains the timeline.
+function drillJitterTile(j, refresh) {
+  if (!j) return [];
+  const zigzag = j.alternating <= -0.25;
+  const steady = j.displayedSd <= 0.05 * refresh;
+  const tip = `Frame time is the gap between the game's Present calls: it wanders ${j.frameSd.toFixed(2)} ms (1 standard deviation) around ${j.frameMean.toFixed(2)} ms, ` +
+    `and 99% of frames are within ${j.frameP99Dev.toFixed(2)} ms of that. On-screen time wanders only ${j.displayedSd.toFixed(2)} ms. ` +
+    (zigzag ? `Frame times alternate (late frame, then early frame; lag-1 correlation ${j.alternating.toFixed(2)}), the zigzag of a frame limiter or vsync wait. It averages out, so it is not judder. `
+      : `Frame-to-frame correlation is ${j.alternating.toFixed(2)}. `) +
+    'Stalls (frames held 1.5+ refreshes) are excluded. Informational; it does not change the grade.';
+  const kind = !steady ? 'warn' : undefined;
+  return [[`±${j.frameSd.toFixed(2)} ms`,
+    `frame-time jitter · ${steady ? (zigzag ? 'zigzag, on-screen time steady' : 'on-screen time steady') : `on-screen time varies ±${j.displayedSd.toFixed(2)} ms`}`, tip, kind]];
+}
 //#endregion drill-core
 
 const drillEl = id => document.getElementById(id);
@@ -1095,6 +1138,7 @@ function drillRender(csv, res, rec, file, sys) {
       [drillInt(res.misses.length), `missed refreshes (2×: ${res.doubled} · 3×+: ${res.triple})`],
       [worstMiss ? `${drillFmt(worstMiss.ms, 1)} ms` : '&ndash;', worstMiss ? `longest stall (${worstMiss.refreshes} refreshes) at ${drillFmt(sec(st[worstMiss.r]), 1)} s` : 'longest stall'],
       [`${drillFmt(res.effective, 3)}%`, `effective miss % (cluster ×${drillFmt(res.multiplier, 2)}, peak ${res.peak} per ${res.cfg.ClusterWindowSec} s)`],
+      ...drillJitterTile(drillJitter(csv, res), refresh),
     ] },
     { title: 'Load', tiles: [...blame.load, ...drillLoadChips(rec)] },
     { title: 'Diagnosis', tiles: [
