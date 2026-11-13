@@ -840,6 +840,7 @@ PERF_CSS += """#tab-perf {
                        border: 1px solid var(--cp-border); background: var(--cp-surface-soft); color: var(--cp-text); }
   .drill-hint button:hover { border-color: var(--cp-accent); color: var(--cp-accent); }
   .drill-chain { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin: 10px 0; font-size: 13px; color: var(--cp-text-muted); }
+  .drill-chain[hidden] { display: none; }
   .drill-when { font-size: 13px; font-weight: 400; color: var(--cp-text-muted); margin-left: 6px; font-variant-numeric: tabular-nums; }
   .drill-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; margin: 14px 0 20px; align-items: start; }
   .drill-group { background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: var(--radius); padding: 10px 12px 12px; }
@@ -936,6 +937,25 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       CPU is the whole machine (all cores); busiest core shows a single saturated thread that the total hides. GPU is the busiest engine of
       the adapter. Red ticks are the same missed refreshes as above. The tool starts recording a few seconds before the first game frame, so the
       first seconds are not shown here.</p></details>
+    </div>
+    <div class="card" id="drillProcCard" hidden>
+      <div class="chart-header">
+        <h2>Processes during the run</h2>
+        <div class="chart-actions">
+          <select id="drillProcView">
+            <option value="cpu">CPU, stacked</option>
+            <option value="gpu">GPU, stacked</option>
+            <option value="cpuLines">CPU, lines</option>
+            <option value="mem">Memory</option>
+            <option value="io">Disk / network I/O</option>
+          </select>
+          <button type="button" class="drill-reset">Reset zoom</button>
+          <button type="button" class="toggle-expand" data-chart="drillProc">Expand</button>
+        </div>
+      </div>
+      <p class="chart-help">The busiest processes recorded each second &middot; stays in sync with the charts above</p>
+      <div class="drill-canvas short"><canvas id="drillProc"></canvas></div>
+      <p class="chart-note" id="drillProcNote"></p>
     </div>
     <div class="card">
       <div class="chart-header">

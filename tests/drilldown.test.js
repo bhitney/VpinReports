@@ -11,8 +11,8 @@ const played = source.slice(source.indexOf('function drillPlayedAt('), source.in
 const context = vm.createContext({ escapeHtml: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;') });
 vm.runInContext(core + played, context);
 const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup,
-  drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt } = vm.runInContext(
-  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup, drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt })', context);
+  drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt, drillSysProcsAt, drillProcText } = vm.runInContext(
+  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup, drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt, drillSysProcsAt, drillProcText })', context);
 
 // 10 s at 10 ms per frame: warm-up 2 s, tail trim 1 s (graded window 2 s .. 9 s).
 function buildCsv(modeAt) {
@@ -384,4 +384,19 @@ test('a time maps to the sampler second that ends at or after it (each sample av
   assert.equal(at(-1), -1);        // before the first second
   assert.equal(at(3.0001), -1);    // after the last stamp
   assert.equal(at(NaN), -1);
+});
+
+test('busiest processes for a sampler second, highest load first, with a readable label', () => {
+  const sys = drillParseSys({
+    stats: 'QpcMs,CpuTotalPct\n1000,10\n2000,20',
+    procs: 'QpcMs,Pid,ProcessName,CpuPct,GpuPct,WorkingSetMB,IoBytesPerSec\n1000,1,dwm,2.0,9.0,1,0\n1000,2,"a,b",30.0,0.0,1,0\n2000,3,idle,0.1,0.0,1,0',
+  });
+  const p = drillSysProcsAt(sys, 0);
+  assert.deepEqual([...p.map(x => x.name)], ['a,b', 'dwm']);
+  assert.equal(drillProcText(p[0]), 'a,b CPU 30%');
+  assert.equal(drillProcText(p[1]), 'dwm CPU 2% GPU 9%');
+  assert.equal(drillProcText(drillSysProcsAt(sys, 1)[0]), 'idle');
+  assert.equal(drillSysProcsAt(sys, -1).length, 0);
+  assert.equal(drillSysProcsAt(drillParseSys({ stats: 'QpcMs,CpuTotalPct\n1,1' }), 0).length, 0);
+  assert.equal(drillSysProcsAt(null, 0).length, 0);
 });

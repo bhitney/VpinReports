@@ -203,6 +203,58 @@ function drillSysTickAt(series, t) {
   return lo < x.length ? lo : -1;
 }
 
+// The busiest processes the sampler recorded for sampler row `tick`, highest CPU or GPU first: [{ name, pid, cpu, gpu, ws }].
+// Empty when there is no SysProcs file or that second listed none.
+function drillSysProcsAt(sys, tick) {
+  if (!sys || !sys.procs || !sys.stats || !(tick >= 0) || tick >= sys.stats.n) return [];
+  const rows = sys.procsByTick.get(sys.stats.QpcMs[tick]) || [];
+  const p = sys.procs;
+  return rows.map(r => ({ name: p.ProcessName[r], pid: p.Pid[r], cpu: p.CpuPct[r], gpu: p.GpuPct[r], ws: p.WorkingSetMB[r] }))
+    .sort((a, b) => Math.max(b.cpu || 0, b.gpu || 0) - Math.max(a.cpu || 0, a.gpu || 0));
+}
+
+// Per-process values on the sampler's ticks. metric: CpuPct | GpuPct | WorkingSetMB | IoBytesPerSec.
+// The sampler only lists processes above a threshold, so a process is NaN on the ticks where it was not listed.
+// The `topN` processes with the most total (peak for WorkingSetMB) get their own series; the rest are summed into `other`.
+// For CpuPct/GpuPct `rest` is the machine total minus everything listed (the game, which VPinPerfMon leaves out, plus
+// all the small processes); it is NaN where the machine value is missing, and null for the other metrics.
+function drillProcSeries(sys, metric, topN) {
+  if (!sys || !sys.procs || !sys.stats || !sys.stats.n) return null;
+  const n = sys.stats.n, p = sys.procs, vals = p[metric];
+  if (!vals) return null;
+  const peak = metric === 'WorkingSetMB';
+  const score = new Map();
+  for (let r = 0; r < p.n; r++) {
+    const v = vals[r];
+    if (!Number.isFinite(v)) continue;
+    const name = p.ProcessName[r];
+    score.set(name, peak ? Math.max(score.get(name) || 0, v) : (score.get(name) || 0) + v);
+  }
+  const names = [...score.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+  const top = names.slice(0, topN), topSet = new Set(top);
+  const data = {};
+  top.forEach(name => { data[name] = new Float64Array(n).fill(NaN); });
+  const other = new Float64Array(n), listed = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    for (const r of sys.procsByTick.get(sys.stats.QpcMs[i]) || []) {
+      const v = vals[r];
+      if (!Number.isFinite(v)) continue;
+      const name = p.ProcessName[r];
+      listed[i] += v;
+      if (topSet.has(name)) data[name][i] = (Number.isFinite(data[name][i]) ? data[name][i] : 0) + v;
+      else other[i] += v;
+    }
+  }
+  const machine = metric === 'CpuPct' ? sys.stats.CpuTotalPct : metric === 'GpuPct' ? sys.stats.GpuTotalPct : null;
+  const rest = machine ? Float64Array.from(listed, (l, i) => (Number.isFinite(machine[i]) ? Math.max(0, machine[i] - l) : NaN)) : null;
+  return { names: top, hiddenCount: Math.max(0, names.length - top.length), data, other, rest };
+}
+
+function drillProcText(p) {
+  const part = (label, v) => (Number.isFinite(v) && v >= 0.5 ? ` ${label} ${v.toFixed(0)}%` : '');
+  return `${p.name}${part('CPU', p.cpu)}${part('GPU', p.gpu)}`;
+}
+
 function drillPickSwap(csv, rec, from, forceSwap) {
   const counts = new Map();
   for (let r = 0; r < csv.n; r++) if (csv.CPUStartTime[r] >= from) counts.set(csv.swap[r], (counts.get(csv.swap[r]) || 0) + 1);
@@ -871,7 +923,7 @@ const drillBandsPlugin = {
 };
 
 // Charts that share one x axis (zoom and pan stay in sync). The system lane only exists when sampler data was loaded.
-const drillLinked = () => [drillCharts.timeline, drillCharts.busy, drillCharts.sys].filter(Boolean);
+const drillLinked = () => [drillCharts.timeline, drillCharts.busy, drillCharts.sys, drillCharts.proc].filter(Boolean);
 
 function drillSync({ chart }) {
   if (drillSyncing) return;
@@ -935,6 +987,10 @@ function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax) {
     options: (() => {
       const o = drillLineOptions('%', xMax, { bands, marks, modeMarks }, item => `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`);
       o.scales.y.max = 100;
+      if (sys.procs) o.plugins.tooltip.callbacks.afterBody = items => {
+        const procs = drillSysProcsAt(sys, items[0]?.raw?.i);
+        return procs.length ? ['Busiest processes:', ...procs.map(p => `  ${drillProcText(p)}`)] : [];
+      };
       return o;
     })(),
   });
@@ -944,6 +1000,63 @@ function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax) {
   if (sys.stats.skipped) note.push(`${sys.stats.skipped} cut-off row(s) skipped.`);
   if (sys.problems && sys.problems.length) note.push(`Not available: ${sys.problems.join('; ')}.`);
   drillEl('drillSysNote').textContent = note.join(' ');
+}
+
+// ---- processes lane: what the sampler's busiest processes were doing, on the same x axis; several views to choose from ----
+let drillProcCtx = null;
+const DRILL_PROC_COLORS = ['#e8a33d', '#6c9bd2', '#c06c84', '#8fbf6a', '#a98bd6', '#4fc1c0', '#d9d06b', '#e07b5b'];
+const DRILL_PROC_VIEWS = {
+  cpu: { metric: 'CpuPct', stacked: true, unit: '%', label: 'CPU, stacked (% of whole machine)', max: 100, rest: 'Game and everything unlisted',
+    help: 'Each band is one process. The top band is the machine total minus every process listed, which includes the game itself (VPinPerfMon leaves it out) and all the small ones.' },
+  gpu: { metric: 'GpuPct', stacked: true, unit: '%', label: 'GPU, stacked (% of busiest engine)', max: 100, rest: 'Game and everything unlisted',
+    help: 'Each band is one process\u2019s share of GPU engine time. The top band is the machine total minus every process listed, which includes the game.' },
+  cpuLines: { metric: 'CpuPct', stacked: false, unit: '%', label: 'CPU, one line per process (%)', help: 'Same data as the stacked view, as separate lines, so a single process spike is easy to see.' },
+  mem: { metric: 'WorkingSetMB', stacked: false, unit: 'MB', label: 'Memory (working set, MB)', help: 'Working set of each process, shown only while the sampler listed it.' },
+  io: { metric: 'IoBytesPerSec', stacked: false, unit: 'MB/s', scale: 1 / 1048576, label: 'Disk / network I/O (MB/s)', help: 'IO data rate of each process (file, network and device reads and writes together), shown only while the sampler listed it.' },
+};
+
+function drillRenderProc() {
+  const card = drillEl('drillProcCard');
+  if (drillCharts.proc) { drillCharts.proc.destroy(); delete drillCharts.proc; }
+  const ctx = drillProcCtx;
+  const series = ctx ? drillSysSeries(ctx.sys, ctx.csv, ctx.res) : null;
+  if (!series || !ctx.sys.procs) { card.hidden = true; return; }
+  card.hidden = false;
+  const view = DRILL_PROC_VIEWS[drillEl('drillProcView').value] || DRILL_PROC_VIEWS.cpu;
+  const ps = drillProcSeries(ctx.sys, view.metric, 7);
+  if (!ps) { card.hidden = true; return; }
+  const k = view.scale || 1;
+  const toPts = (arr, gapAsZero) => {
+    const out = [];
+    for (let i = 0; i < series.n; i++) {
+      const v = arr[i];
+      if (Number.isFinite(v)) out.push({ x: series.x[i], y: v * k, i });
+      else if (gapAsZero) out.push({ x: series.x[i], y: 0, i });
+    }
+    return out;
+  };
+  const sets = ps.names.map((name, j) => {
+    const c = DRILL_PROC_COLORS[j % DRILL_PROC_COLORS.length];
+    return { label: name, data: toPts(ps.data[name], view.stacked), borderColor: c, backgroundColor: view.stacked ? drillAlpha(c, 0.7) : c,
+      borderWidth: view.stacked ? 0.5 : 1.5, pointRadius: 0, fill: view.stacked, stack: view.stacked ? 's' : undefined };
+  });
+  if (view.stacked) {
+    if (ps.hiddenCount) sets.push({ label: `${ps.hiddenCount} other listed process${ps.hiddenCount === 1 ? '' : 'es'}`, data: toPts(ps.other, true),
+      borderColor: colors.muted, backgroundColor: drillAlpha(colors.muted, 0.6), borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
+    if (ps.rest) sets.push({ label: view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
+      borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
+  }
+  const o = drillLineOptions(view.unit, ctx.xMax, { bands: ctx.bands, marks: ctx.marks, modeMarks: ctx.modeMarks },
+    item => `${item.dataset.label}: ${item.parsed.y.toFixed(view.unit === '%' ? 1 : view.unit === 'MB/s' ? 2 : 0)} ${view.unit}`);
+  o.plugins.decimation = { enabled: false };
+  o.interaction = { mode: 'index', axis: 'x', intersect: false };
+  o.plugins.tooltip.itemSort = (a, b) => b.parsed.y - a.parsed.y;
+  o.plugins.tooltip.filter = item => item.parsed.y > 0;
+  if (view.stacked) { o.scales.y.stacked = true; o.scales.y.max = view.max; }
+  drillCharts.proc = new Chart(drillEl('drillProc'), { type: 'line', plugins: [drillBandsPlugin], data: { datasets: sets }, options: o });
+  const zoomed = drillCharts.timeline && drillCharts.timeline.scales.x;
+  if (zoomed && (zoomed.min > 0 || zoomed.max < ctx.xMax)) drillCharts.proc.zoomScale('x', { min: zoomed.min, max: zoomed.max }, 'none');
+  drillEl('drillProcNote').textContent = `${view.help} Only processes the sampler listed are shown (top few by CPU or GPU each second); ${ps.hiddenCount ? `${ps.hiddenCount} smaller one(s) are grouped.` : 'no others were listed.'}`;
 }
 
 function drillRender(csv, res, rec, file, sys) {
@@ -1076,6 +1189,8 @@ function drillRender(csv, res, rec, file, sys) {
   });
 
   drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax);
+  drillProcCtx = { sys, csv, res, bands, marks, modeMarks, xMax };
+  drillRenderProc();
 
   // ---- histogram of on-screen time in refreshes
   const bins = [];
@@ -1180,16 +1295,19 @@ function drillRender(csv, res, rec, file, sys) {
 
   // ---- stall list
   const LIMIT = 200;
+  const sysSeries = drillSysSeries(sys, csv, res);
+  const showProcs = !!(sysSeries && sys.procs);
   const stalls = res.misses.slice().sort((a, b) => b.ratio - a.ratio || a.r - b.r).slice(0, LIMIT).sort((a, b) => a.r - b.r);
   drillEl('drillStallsTitle').textContent = res.misses.length
     ? `Stalls (${res.misses.length}${res.misses.length > LIMIT ? `, worst ${LIMIT} shown` : ''})` : 'Stalls (none — every graded frame was on time)';
   drillEl('drillStalls').innerHTML = res.misses.length ? `<table class="anomaly-table"><thead><tr>
       <th class="num">Time (s)</th><th class="num">Refreshes</th><th class="num">On screen (ms)</th><th class="num">CPU busy</th>
-      <th class="num">GPU busy</th><th class="num">Next frame time</th><th>Likely cause</th><th>Present mode</th><th></th></tr></thead><tbody>` +
+      <th class="num">GPU busy</th><th class="num">Next frame time</th><th>Likely cause</th><th>Present mode</th>${showProcs ? '<th>Busiest processes</th>' : ''}<th></th></tr></thead><tbody>` +
     stalls.map(m => `<tr><td class="num">${drillFmt(sec(st[m.r]), 2)}</td>
       <td class="num" style="color:${m.triple ? colors.danger : colors.warning}">${m.refreshes}×</td>
       <td class="num">${drillFmt(m.ms, 1)}</td><td class="num">${drillFmt(m.cpu, 1)}</td><td class="num">${drillFmt(m.gpu, 1)}</td>
       <td class="num">${drillFmt(m.nextFt, 1)}</td><td>${escapeHtml(m.cause)}</td><td class="muted">${escapeHtml(m.mode || '')}</td>
+      ${showProcs ? `<td class="muted">${escapeHtml(drillSysProcsAt(sys, drillSysTickAt(sysSeries, sec(st[m.r]))).slice(0, 3).map(drillProcText).join(', '))}</td>` : ''}
       <td><button type="button" data-x="${sec(st[m.r])}">Zoom</button></td></tr>`).join('') + '</tbody></table>' : '';
 
   drillStatus(rec
@@ -1230,6 +1348,7 @@ drillEl('drillStalls').addEventListener('click', e => {
 });
 document.querySelectorAll('#drillResults .drill-reset').forEach(btn =>
   btn.addEventListener('click', () => drillLinked().forEach(c => c.resetZoom('none'))));
+drillEl('drillProcView').addEventListener('change', drillRenderProc);
 
 const drillZone = drillEl('drillZone');
 ['dragenter', 'dragover'].forEach(type => drillZone.addEventListener(type, e => {
