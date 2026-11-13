@@ -1254,7 +1254,7 @@ function drillRender(csv, res, rec, file, sys) {
     plugins: [drillBandsPlugin],
     data: { datasets: [
       { label: 'CPU busy (ms)', data: cpuData, borderColor: colors.warning, backgroundColor: colors.warning, borderWidth: 1, pointRadius: 0 },
-      { label: 'GPU busy (ms)', data: gpuData, borderColor: colors.accent, backgroundColor: colors.accent, borderWidth: 1, pointRadius: 0 },
+      { label: 'GPU busy (ms)', data: gpuData, borderColor: '#4299e1', backgroundColor: '#4299e1', borderWidth: 1, pointRadius: 0 },
       ...drillFlagLegend(flagMarks),
     ] },
     options: drillLineOptions('ms', xMax,
