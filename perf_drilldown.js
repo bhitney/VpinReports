@@ -91,6 +91,118 @@ function drillParseLog(text) {
   return m ? +m[1] : NaN;
 }
 
+// ---- system sampler files: SysStats_<stem>.csv, SysProcs_<stem>.csv, SysEvents_<stem>.csv (VPinPerfMon --sysstats) ----
+// They share the run CSV's name stem and its QPC clock (QpcMs = CPUStartQPCTime's clock), one row per second.
+const DRILL_SYS_RE = /^(SysStats|SysProcs|SysEvents)_(.+)\.csv$/i;
+const DRILL_SYS_STATS_NUM = ['QpcMs', 'CpuTotalPct', 'CpuMaxCorePct', 'DpcPct', 'InterruptPct', 'CtxSwitchesPerSec', 'DiskBytesPerSec',
+  'DiskQueue', 'MemAvailMB', 'PagesInputPerSec', 'GpuTotalPct', 'SampleMs', 'SampleCpuMs', 'ReadMs', 'ComputeMs'];
+const DRILL_SYS_PROCS_NUM = ['QpcMs', 'Pid', 'CpuPct', 'GpuPct', 'WorkingSetMB', 'IoBytesPerSec'];
+
+// PresentMon_<stem>.csv -> <stem> (null for any other name).
+function drillSysStem(csvName) {
+  const m = /^PresentMon_(.+)\.csv$/i.exec(csvName || '');
+  return m ? m[1] : null;
+}
+
+// One CSV line to cells. VPinPerfMon quotes a process name that contains a comma or a quote.
+function drillSplitLine(line) {
+  if (line.indexOf('"') < 0) return line.split(',');
+  const cells = [];
+  let cur = '', quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch !== '"') cur += ch;
+      else if (line[i + 1] === '"') { cur += '"'; i++; }
+      else quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ',') { cells.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  cells.push(cur);
+  return cells;
+}
+
+// numCols are read as numbers (an empty cell is NaN); every other column is kept as text. A row with fewer cells than
+// the header (the tool was stopped while writing) is dropped and counted in `skipped`.
+function drillParseSysTable(text, numCols) {
+  const lines = text.split(/\r?\n/);
+  const header = (lines[0] || '').replace(/^\uFEFF/, '').split(',').map(s => s.trim());
+  if (!header.includes('QpcMs')) throw new Error('no QpcMs column');
+  const all = [];
+  for (let i = 1; i < lines.length; i++) if (lines[i].length) all.push(drillSplitLine(lines[i]));
+  const rows = all.filter(cells => cells.length >= header.length);
+  const n = rows.length;
+  const table = { n, header, skipped: all.length - n };
+  header.forEach((name, k) => {
+    if (numCols.includes(name)) {
+      const col = new Float64Array(n);
+      for (let r = 0; r < n; r++) { const s = rows[r][k]; col[r] = s === '' || s === undefined ? NaN : +s; }
+      table[name] = col;
+    } else {
+      const col = new Array(n);
+      for (let r = 0; r < n; r++) col[r] = rows[r][k] ?? '';
+      table[name] = col;
+    }
+  });
+  return table;
+}
+
+// texts: { stats, procs, events } as strings (undefined when that file was not found). SysStats is required;
+// a damaged SysProcs or SysEvents is reported in `problems` and left out instead of failing the whole run.
+function drillParseSys(texts) {
+  if (!texts || typeof texts.stats !== 'string') return null;
+  const sys = { stats: drillParseSysTable(texts.stats, DRILL_SYS_STATS_NUM), procs: null, events: null, procsByTick: new Map(), problems: [] };
+  if (typeof texts.procs === 'string') {
+    try {
+      sys.procs = drillParseSysTable(texts.procs, DRILL_SYS_PROCS_NUM);
+      for (let r = 0; r < sys.procs.n; r++) {
+        const key = sys.procs.QpcMs[r];
+        let rows = sys.procsByTick.get(key);
+        if (!rows) sys.procsByTick.set(key, rows = []);
+        rows.push(r);
+      }
+    } catch (err) { sys.problems.push(`SysProcs: ${err.message}`); }
+  }
+  if (typeof texts.events === 'string') {
+    try { sys.events = drillParseSysTable(texts.events, ['QpcMs', 'Pid']); } catch (err) { sys.problems.push(`SysEvents: ${err.message}`); }
+  }
+  return sys;
+}
+
+// Sampler rows as chart points: x = seconds since the first frame (res.t0), the same zero as the frame timeline.
+// Only valid when the run CSV is on the QPC clock (csv.timeBase === 'qpc'): a relative CSV has no clock in common with
+// the sampler, so it gets none. Returns null when there is nothing to show, else { points, ... } (see below).
+function drillSysSeries(sys, csv, res) {
+  if (!sys || !sys.stats || !sys.stats.n || !csv || csv.timeBase !== 'qpc' || !Number.isFinite(res?.t0)) return null;
+  const s = sys.stats;
+  const x = new Float64Array(s.n);
+  for (let i = 0; i < s.n; i++) x[i] = (s.QpcMs[i] - res.t0) / 1000;
+  const pts = col => {
+    const out = [];
+    if (!s[col]) return out;
+    for (let i = 0; i < s.n; i++) if (Number.isFinite(x[i]) && Number.isFinite(s[col][i])) out.push({ x: x[i], y: s[col][i], i });
+    return out;
+  };
+  // Each sample is stamped at the end of the second it averages, so a point covers (x - 1, x].
+  return {
+    x, n: s.n,
+    cpu: pts('CpuTotalPct'), core: pts('CpuMaxCorePct'), gpu: pts('GpuTotalPct'),
+    firstX: x[0], lastX: x[s.n - 1],
+  };
+}
+
+// The sampler second that covers time `t` (seconds since the first frame): the first sample stamped at or after t,
+// because each sample averages the second before its stamp. Returns the row index, or -1 when t is outside the data.
+function drillSysTickAt(series, t) {
+  if (!series || !Number.isFinite(t)) return -1;
+  const x = series.x;
+  if (t > x[x.length - 1] || t <= x[0] - 1) return -1;
+  let lo = 0, hi = x.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (x[mid] < t) lo = mid + 1; else hi = mid; }
+  return lo < x.length ? lo : -1;
+}
+
 function drillPickSwap(csv, rec, from, forceSwap) {
   const counts = new Map();
   for (let r = 0; r < csv.n; r++) if (csv.CPUStartTime[r] >= from) counts.set(csv.swap[r], (counts.get(csv.swap[r]) || 0) + 1);
@@ -368,6 +480,9 @@ const drillFmt = (v, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : '&ndash;');
 const drillInt = v => (Number.isFinite(v) ? Math.round(v).toLocaleString() : '&ndash;');
 const drillGradeTag = g => (g ? `<span class="drill-grade" style="background:${gradeColors[g] || colors.muted}">${g}</span>` : '&ndash;');
 const drillHasFile = rec => !!(rec && rec.RawFile && drillFiles.has(rec.RawFile.toLowerCase()));
+const drillIsSysName = name => DRILL_SYS_RE.test(name);
+const drillSysFileCount = () => [...drillFiles.keys()].filter(n => drillIsSysName(n) && n.endsWith('.csv')).length;
+const drillRunFileCount = () => [...drillFiles.keys()].filter(n => n.endsWith('.csv') && !drillIsSysName(n)).length;
 
 function drillRefreshRuns() {
   const select = drillEl('drillRun');
@@ -385,7 +500,7 @@ function drillRefreshRuns() {
   select.value = drillRid != null ? String(drillRid) : '';
   const onDisk = rows.filter(r => r.LogOnDisk === 1).length;
   drillEl('drillCount').textContent = drillFiles.size
-    ? `${drillFolderLabel ? drillFolderLabel + ': ' : ''}${drillFiles.size} CSV file(s) connected · ● ${available} of these runs available`
+    ? `${drillFolderLabel ? drillFolderLabel + ': ' : ''}${drillRunFileCount()} CSV file(s) connected${drillSysFileCount() ? ` (+ ${drillSysFileCount()} system sampler file(s))` : ''} · ● ${available} of these runs available`
     : drillLogs.checked && drillLogs.found ? `○ ${onDisk} of these runs had their CSV in the logs folder at build time` : '';
 }
 
@@ -462,10 +577,11 @@ async function drillLoad(entry, rec) {
     if (token !== drillToken) return;
     const csv = drillParseCsv(text);
     const logSec = await drillReadLogWarmup(file.name);
+    const sys = await drillReadSys(file.name);
     if (token !== drillToken) return;
-    drillCtx = { csv, rec, file, logSec };
+    drillCtx = { csv, rec, file, logSec, sys };
     const res = drillAnalyze(csv, rec, rec ? drillCfgs[rec.CfgIdx] : drillCfgs[0], logSec, drillSwapPick);
-    drillRender(csv, res, rec, file);
+    drillRender(csv, res, rec, file, sys);
   } catch (err) {
     if (token !== drillToken) return;
     drillStatus(`Could not analyze this capture: ${escapeHtml(err.message || err)}`, 'error');
@@ -475,9 +591,9 @@ async function drillLoad(entry, rec) {
 // Re-run the analysis on the already-loaded CSV after the user picks another swap chain.
 function drillReanalyze() {
   if (!drillCtx) return;
-  const { csv, rec, file, logSec } = drillCtx;
+  const { csv, rec, file, logSec, sys } = drillCtx;
   try {
-    drillRender(csv, drillAnalyze(csv, rec, rec ? drillCfgs[rec.CfgIdx] : drillCfgs[0], logSec, drillSwapPick), rec, file);
+    drillRender(csv, drillAnalyze(csv, rec, rec ? drillCfgs[rec.CfgIdx] : drillCfgs[0], logSec, drillSwapPick), rec, file, sys);
   } catch (err) {
     drillStatus(`Could not analyze this swap chain: ${escapeHtml(err.message || err)}`, 'error');
   }
@@ -495,11 +611,31 @@ async function drillReadLogWarmup(csvName) {
   }
 }
 
+// The system sampler files that belong to this run (same name stem), or null when SysStats is not there.
+// Never throws: a missing or damaged sampler file must not stop the run itself from loading.
+async function drillReadSys(csvName) {
+  const stem = drillSysStem(csvName);
+  if (!stem) return null;
+  const read = async prefix => {
+    const entry = drillFiles.get(`${prefix}_${stem}.csv`.toLowerCase());
+    if (!entry) return undefined;
+    const file = entry.getFile ? await entry.getFile() : entry;
+    return file.text();
+  };
+  try {
+    const [stats, procs, events] = await Promise.all([read('SysStats'), read('SysProcs'), read('SysEvents')]);
+    const sys = drillParseSys({ stats, procs, events });
+    return sys && sys.stats.n ? sys : null;
+  } catch (err) {
+    return { stats: null, problems: [`could not read the system sampler files: ${err.message || err}`] };
+  }
+}
+
 // Returns the number of CSVs added; matching TXT logs are kept too.
 function drillAddFiles(list) {
   let added = 0;
   for (const f of list) {
-    if (/\.csv$/i.test(f.name)) { drillFiles.set(f.name.toLowerCase(), f); added++; }
+    if (/\.csv$/i.test(f.name)) { drillFiles.set(f.name.toLowerCase(), f); if (!drillIsSysName(f.name)) added++; }
     else if (/\.txt$/i.test(f.name)) drillFiles.set(f.name.toLowerCase(), f);
   }
   return added;
@@ -507,8 +643,8 @@ function drillAddFiles(list) {
 
 // Drop / open: one known file opens its run; an unknown single file is analyzed standalone.
 function drillUseFiles(files) {
-  const csvs = [...files].filter(f => /\.csv$/i.test(f.name));
-  if (!csvs.length) { drillStatus('Please choose a PresentMon .csv file (optionally with its .txt log).', 'warn'); return; }
+  const csvs = [...files].filter(f => /\.csv$/i.test(f.name) && !drillIsSysName(f.name));
+  if (!csvs.length) { drillStatus('Please choose a PresentMon .csv file (optionally with its .txt log and the SysStats / SysProcs / SysEvents files).', 'warn'); return; }
   drillAddFiles(files);
   const match = csvs.map(f => rawRecords.find(r => r.RawFile && r.RawFile.toLowerCase() === f.name.toLowerCase())).find(Boolean);
   const current = drillRid != null ? rawRecords[drillRid] : null;
@@ -552,7 +688,7 @@ function drillAfterConnect(label) {
   drillRefreshRuns();
   const current = drillRid != null ? rawRecords[drillRid] : null;
   if (drillHasFile(current)) { drillOpenRecord(drillRid); return; }
-  drillStatus(`Connected <code>${escapeHtml(label)}</code>: ${drillFiles.size} CSV file(s), ${known} of the report's runs found. ` +
+  drillStatus(`Connected <code>${escapeHtml(label)}</code>: ${drillRunFileCount()} CSV file(s), ${known} of the report's runs found. ` +
     'Click a chart point or pick a run (● = available).', known ? 'ok' : 'warn');
 }
 
@@ -734,18 +870,21 @@ const drillBandsPlugin = {
   },
 };
 
+// Charts that share one x axis (zoom and pan stay in sync). The system lane only exists when sampler data was loaded.
+const drillLinked = () => [drillCharts.timeline, drillCharts.busy, drillCharts.sys].filter(Boolean);
+
 function drillSync({ chart }) {
   if (drillSyncing) return;
   drillSyncing = true;
   const { min, max } = chart.scales.x;
-  for (const other of [drillCharts.timeline, drillCharts.busy]) {
-    if (other && other !== chart) other.zoomScale('x', { min, max }, 'none');
+  for (const other of drillLinked()) {
+    if (other !== chart) other.zoomScale('x', { min, max }, 'none');
   }
   drillSyncing = false;
 }
 
 function drillZoomTo(x) {
-  for (const c of [drillCharts.timeline, drillCharts.busy]) c?.zoomScale('x', { min: Math.max(0, x - 1), max: x + 1 }, 'none');
+  for (const c of drillLinked()) c.zoomScale('x', { min: Math.max(0, x - 1), max: x + 1 }, 'none');
   drillEl('drillTimeline').closest('.card').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
@@ -773,9 +912,44 @@ function drillLineOptions(ylabel, xMax, overlay, tooltipLabel) {
   };
 }
 
-function drillRender(csv, res, rec, file) {
+// ---- system load lane: whole-machine CPU / busiest core / GPU from the sampler, on the frame timeline's x axis ----
+// Hidden when the run has no sampler data (older runs, --sysstats false, or sampler files not connected).
+function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax) {
+  const card = drillEl('drillSysCard');
+  const series = drillSysSeries(sys, csv, res);
+  if (!series) {
+    card.hidden = true;
+    if (sys && sys.problems && sys.problems.length) console.warn('VPinPerfMon sampler files:', sys.problems.join('; '));
+    return;
+  }
+  card.hidden = false;
+  const line = (label, data, color, width) => ({ label, data, borderColor: color, backgroundColor: color, borderWidth: width, pointRadius: 0 });
+  drillCharts.sys = new Chart(drillEl('drillSys'), {
+    type: 'line',
+    plugins: [drillBandsPlugin],
+    data: { datasets: [
+      line('CPU, whole machine (%)', series.cpu, colors.warning, 1.5),
+      line('CPU, busiest core (%)', series.core, drillAlpha(colors.warning, 0.45), 1),
+      line('GPU, busiest engine (%)', series.gpu, colors.accent, 1.5),
+    ] },
+    options: (() => {
+      const o = drillLineOptions('%', xMax, { bands, marks, modeMarks }, item => `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`);
+      o.scales.y.max = 100;
+      return o;
+    })(),
+  });
+  const note = [];
+  const shown = series.cpu.length;
+  note.push(`${shown} one-second samples; each covers the second before its point.`);
+  if (sys.stats.skipped) note.push(`${sys.stats.skipped} cut-off row(s) skipped.`);
+  if (sys.problems && sys.problems.length) note.push(`Not available: ${sys.problems.join('; ')}.`);
+  drillEl('drillSysNote').textContent = note.join(' ');
+}
+
+function drillRender(csv, res, rec, file, sys) {
   Object.values(drillCharts).forEach(c => c.destroy());
-  drillLast = { csv, res, rec, file };
+  for (const k of Object.keys(drillCharts)) delete drillCharts[k];
+  drillLast = { csv, res, rec, file, sys };
   drillEl('drillResults').hidden = false;
   const st = csv.CPUStartTime, dt = csv.DisplayedTime;
   const sec = ms => (ms - res.t0) / 1000;
@@ -900,6 +1074,8 @@ function drillRender(csv, res, rec, file) {
       { bands, marks, modeMarks, lines: [{ value: refresh, label: `1 refresh ${refresh.toFixed(1)} ms` }] },
       item => `${item.dataset.label}: ${item.parsed.y.toFixed(2)}`),
   });
+
+  drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax);
 
   // ---- histogram of on-screen time in refreshes
   const bins = [];
@@ -1032,7 +1208,7 @@ drillEl('drillChain').addEventListener('change', e => {
 });
 drillEl('drillUnderlay').addEventListener('change', e => {
   drillUnderlay = e.target.checked;
-  if (drillLast) drillRender(drillLast.csv, drillLast.res, drillLast.rec, drillLast.file);
+  if (drillLast) drillRender(drillLast.csv, drillLast.res, drillLast.rec, drillLast.file, drillLast.sys);
 });
 drillEl('drillFolderBtn').addEventListener('click', drillConnectFolder);
 drillEl('drillFileBtn').addEventListener('click', () => drillEl('drillFileInput').click());
@@ -1053,7 +1229,7 @@ drillEl('drillStalls').addEventListener('click', e => {
   if (btn) drillZoomTo(Number(btn.dataset.x));
 });
 document.querySelectorAll('#drillResults .drill-reset').forEach(btn =>
-  btn.addEventListener('click', () => [drillCharts.timeline, drillCharts.busy].forEach(c => c?.resetZoom('none'))));
+  btn.addEventListener('click', () => drillLinked().forEach(c => c.resetZoom('none'))));
 
 const drillZone = drillEl('drillZone');
 ['dragenter', 'dragover'].forEach(type => drillZone.addEventListener(type, e => {

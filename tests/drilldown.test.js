@@ -10,8 +10,9 @@ const played = source.slice(source.indexOf('function drillPlayedAt('), source.in
 
 const context = vm.createContext({ escapeHtml: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;') });
 vm.runInContext(core + played, context);
-const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup } = vm.runInContext(
-  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup })', context);
+const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup,
+  drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt } = vm.runInContext(
+  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup, drillParseSys, drillSysStem, drillSplitLine, drillSysSeries, drillSysTickAt })', context);
 
 // 10 s at 10 ms per frame: warm-up 2 s, tail trim 1 s (graded window 2 s .. 9 s).
 function buildCsv(modeAt) {
@@ -281,4 +282,106 @@ test('the warm-up can be inferred from the stored frame count with a QPC origin'
 test('a CSV with neither time column is refused with a message that names both', () => {
   assert.throws(() => drillParseCsv('FrameTime,DisplayedTime\n1,2'), /CPUStartTime \(or CPUStartQPCTime\)/);
   assert.throws(() => drillParseCsv('CPUStartQPCTime,FrameTime\n1,2'), /DisplayedTime/);
+});
+
+// ---------------------------------------------------------------------------
+// System sampler files (VPinPerfMon --sysstats): SysStats_, SysProcs_ and SysEvents_ next to the run CSV.
+// ---------------------------------------------------------------------------
+
+const SYS_STATS = 'QpcMs,UtcTime,CpuTotalPct,CpuMaxCorePct,DpcPct,InterruptPct,CtxSwitchesPerSec,DiskBytesPerSec,DiskQueue,MemAvailMB,PagesInputPerSec,GpuTotalPct,ForegroundProcess,SampleMs,SampleCpuMs,ReadMs,ComputeMs\n' +
+  '12417000.5000,2026-11-12T21:49:56Z,10.5,30.1,0.2,0.4,20000,1000,0.00,26000,0.0,35.5,VPinballX64,3.1,2.0,2.4,0.7\n' +
+  '12418000.5000,2026-11-12T21:49:57Z,71.0,98.2,0.3,0.5,21000,2000,0.00,26000,0.0,36.0,VPinballX64,3.4,3.1,2.5,0.9\n' +
+  '12419000.5000,2026-11-12T21:49:58Z,,,0.1,0.2,19000,500,0.00,26000,0.0,,"Odd, name",3.0,2.0,2.4,0.6\n';
+const SYS_PROCS = 'QpcMs,Pid,ProcessName,CpuPct,GpuPct,WorkingSetMB,IoBytesPerSec\n' +
+  '12418000.5000,812,powershell,49.80,0.00,55.5,0\n' +
+  '12418000.5000,4400,PinUpDisplayX,3.10,5.20,311.0,428277\n' +
+  '12419000.5000,4400,"we,ird",1.20,0.00,311.0,0\n';
+const SYS_EVENTS = 'QpcMs,Event,ProcessName,Pid\n12418000.5000,ProcessStart,powershell,812\n';
+
+test('sampler file names map to the run name stem', () => {
+  assert.equal(drillSysStem('PresentMon_20261112192820_Die Hard Trilogy (VPW 2023).csv'), '20261112192820_Die Hard Trilogy (VPW 2023)');
+  assert.equal(drillSysStem('SysStats_20261112192820_Die Hard Trilogy (VPW 2023).csv'), null);
+  assert.equal(drillSysStem('other.csv'), null);
+});
+
+test('quoted cells are split correctly', () => {
+  assert.deepEqual([...drillSplitLine('1.0,12,"a,b",3.5')], ['1.0', '12', 'a,b', '3.5']);
+  assert.deepEqual([...drillSplitLine('1,"he said ""hi""",2')], ['1', 'he said "hi"', '2']);
+  assert.deepEqual([...drillSplitLine('a,b,c')], ['a', 'b', 'c']);
+});
+
+test('SysStats, SysProcs and SysEvents are parsed; empty cells are NaN and QpcMs keeps its precision', () => {
+  const sys = drillParseSys({ stats: SYS_STATS, procs: SYS_PROCS, events: SYS_EVENTS });
+  assert.equal(sys.stats.n, 3);
+  assert.equal(sys.stats.QpcMs[0], 12417000.5);
+  assert.equal(sys.stats.CpuTotalPct[1], 71);
+  assert.ok(Number.isNaN(sys.stats.CpuTotalPct[2]));
+  assert.ok(Number.isNaN(sys.stats.GpuTotalPct[2]));
+  assert.equal(sys.stats.ForegroundProcess[2], 'Odd, name');
+  assert.equal(sys.stats.SampleCpuMs[0], 2);
+  assert.equal(sys.procs.n, 3);
+  assert.equal(sys.procs.ProcessName[2], 'we,ird');
+  assert.equal(sys.events.n, 1);
+  assert.deepEqual([...sys.procsByTick.get(12418000.5)], [0, 1]);
+  assert.equal(sys.problems.length, 0);
+});
+
+test('an older SysStats without the timing columns, and a row cut off at the end, still load', () => {
+  const old = 'QpcMs,UtcTime,CpuTotalPct,CpuMaxCorePct,DpcPct,InterruptPct,CtxSwitchesPerSec,DiskBytesPerSec,DiskQueue,MemAvailMB,PagesInputPerSec,GpuTotalPct,ForegroundProcess,SampleMs\n' +
+    '100.0,2026-11-12T17:00:00Z,4.5,20,0.1,0.2,15000,1000,0.0,16000,0,2.2,Helper,3.1\n' +
+    '1100.0,2026-11-12T17:00:01Z,5.5,21,0.1,0.2,16000,1000,0.0,16000,0,2.3,Helper,3.0\n' +
+    '2100.0,2026-11-12T17:00:02Z,6';
+  const sys = drillParseSys({ stats: old });
+  assert.equal(sys.stats.n, 2);
+  assert.equal(sys.stats.skipped, 1);
+  assert.equal(sys.stats.SampleCpuMs, undefined);
+  assert.equal(sys.procs, null);
+});
+
+test('without SysStats there is no sampler data; a damaged SysProcs is reported and left out', () => {
+  assert.equal(drillParseSys({ procs: SYS_PROCS }), null);
+  assert.equal(drillParseSys(undefined), null);
+  const sys = drillParseSys({ stats: SYS_STATS, procs: 'nonsense' });
+  assert.equal(sys.stats.n, 3);
+  assert.equal(sys.procs, null);
+  assert.match(sys.problems[0], /SysProcs/);
+  assert.throws(() => drillParseSys({ stats: 'no,time,column\n1,2,3' }), /QpcMs/);
+});
+
+test('sampler time is seconds since the first frame, on the same clock as the QPC run CSV', () => {
+  const csv = drillParseCsv(buildTimed('CPUStartQPCTime', 12417500));
+  const res = drillAnalyze(csv, null, cfg, NaN);
+  assert.equal(res.t0, 12417500);
+  const series = drillSysSeries(drillParseSys({ stats: SYS_STATS }), csv, res);
+  // SysStats rows are stamped 12417000.5, 12418000.5, 12419000.5 ms: the first one is 0.4995 s before the first frame.
+  assert.deepEqual([...series.x].map(v => +v.toFixed(4)), [-0.4995, 0.5005, 1.5005]);
+  assert.equal(series.n, 3);
+  assert.equal(series.cpu.length, 2);                // the row with an empty CPU cell is left out of the line
+  assert.equal(series.cpu[1].y, 71);
+  assert.equal(series.gpu.length, 2);
+  assert.equal(series.firstX, series.x[0]);
+});
+
+test('a relative-origin run CSV has no clock in common with the sampler, so no sampler series is built', () => {
+  const csv = drillParseCsv(buildTimed('CPUStartTime', 1000));
+  const res = drillAnalyze(csv, null, cfg, NaN);
+  assert.equal(drillSysSeries(drillParseSys({ stats: SYS_STATS }), csv, res), null);
+  const qpc = drillParseCsv(buildTimed('CPUStartQPCTime', 12417500));
+  assert.equal(drillSysSeries(null, qpc, drillAnalyze(qpc, null, cfg, NaN)), null);
+});
+
+test('a time maps to the sampler second that ends at or after it (each sample averages the second before its stamp)', () => {
+  const sys = drillParseSys({ stats: 'QpcMs,CpuTotalPct\n1000,10\n2000,20\n3000,30\n4000,40' });
+  const series = drillSysSeries(sys, { timeBase: 'qpc' }, { t0: 1000 });    // x = 0, 1, 2, 3 s
+  assert.deepEqual([...series.x], [0, 1, 2, 3]);
+  const at = t => drillSysTickAt(series, t);
+  assert.equal(at(-0.5), 0);       // inside the second before the first stamp
+  assert.equal(at(0), 0);          // exactly on a stamp: that stamp
+  assert.equal(at(0.0001), 1);
+  assert.equal(at(1), 1);
+  assert.equal(at(2.9), 3);
+  assert.equal(at(3), 3);
+  assert.equal(at(-1), -1);        // before the first second
+  assert.equal(at(3.0001), -1);    // after the last stamp
+  assert.equal(at(NaN), -1);
 });

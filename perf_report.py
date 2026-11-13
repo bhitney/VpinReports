@@ -919,6 +919,24 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
       overlay, popup or window focus change). Frame time is when the app <i>finished</i> the frame &mdash; if it spikes with displayed time the app was late,
       if only displayed time spikes the delay happened after the app (compositor/display).</p></details>
     </div>
+    <div class="card" id="drillSysCard" hidden>
+      <div class="chart-header">
+        <h2>System load during the run</h2>
+        <div class="chart-actions">
+          <button type="button" class="drill-reset">Reset zoom</button>
+          <button type="button" class="toggle-expand" data-chart="drillSys">Expand</button>
+        </div>
+      </div>
+      <p class="chart-help">Whole-machine CPU and GPU, one point per second &middot; stays in sync with the timelines above</p>
+      <div class="drill-canvas short"><canvas id="drillSys"></canvas></div>
+      <p class="chart-note" id="drillSysNote"></p>
+      <details class="chart-more"><summary>More info</summary>
+      <p class="chart-note">Recorded by VPinPerfMon (<code>--sysstats</code>) once a second, from Windows performance counters. Each point is the
+      average of the second before it, so it can show that something else was busy around a stall but not what happened inside a single frame.
+      CPU is the whole machine (all cores); busiest core shows a single saturated thread that the total hides. GPU is the busiest engine of
+      the adapter. Red ticks are the same missed refreshes as above. The tool starts recording a few seconds before the first game frame, so the
+      first seconds are not shown here.</p></details>
+    </div>
     <div class="card">
       <div class="chart-header">
         <h2>CPU vs GPU work per frame</h2>
