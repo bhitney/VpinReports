@@ -96,7 +96,7 @@ function drillParseLog(text) {
 const DRILL_SYS_RE = /^(SysStats|SysProcs|SysEvents)_(.+)\.csv$/i;
 const DRILL_SYS_STATS_NUM = ['QpcMs', 'CpuTotalPct', 'CpuMaxCorePct', 'DpcPct', 'InterruptPct', 'CtxSwitchesPerSec', 'DiskBytesPerSec',
   'DiskQueue', 'MemAvailMB', 'PagesInputPerSec', 'GpuTotalPct', 'SampleMs', 'SampleCpuMs', 'ReadMs', 'ComputeMs'];
-const DRILL_SYS_PROCS_NUM = ['QpcMs', 'Pid', 'CpuPct', 'GpuPct', 'WorkingSetMB', 'IoBytesPerSec'];
+const DRILL_SYS_PROCS_NUM = ['QpcMs', 'Pid', 'CpuPct', 'GpuPct', 'WorkingSetMB', 'IoBytesPerSec', 'Game'];
 
 // PresentMon_<stem>.csv -> <stem> (null for any other name).
 function drillSysStem(csvName) {
@@ -217,7 +217,7 @@ function drillSysProcsAt(sys, tick) {
   if (!sys || !sys.procs || !sys.stats || !(tick >= 0) || tick >= sys.stats.n) return [];
   const rows = sys.procsByTick.get(sys.stats.QpcMs[tick]) || [];
   const p = sys.procs;
-  return rows.map(r => ({ name: p.ProcessName[r], pid: p.Pid[r], cpu: p.CpuPct[r], gpu: p.GpuPct[r], ws: p.WorkingSetMB[r] }))
+  return rows.filter(r => !(p.Game && p.Game[r] === 1)).map(r => ({ name: p.ProcessName[r], pid: p.Pid[r], cpu: p.CpuPct[r], gpu: p.GpuPct[r], ws: p.WorkingSetMB[r] }))
     .sort((a, b) => Math.max(b.cpu || 0, b.gpu || 0) - Math.max(a.cpu || 0, a.gpu || 0));
 }
 
@@ -234,7 +234,7 @@ function drillProcSeries(sys, metric, topN) {
   const score = new Map();
   for (let r = 0; r < p.n; r++) {
     const v = vals[r];
-    if (!Number.isFinite(v)) continue;
+    if (!Number.isFinite(v) || (p.Game && p.Game[r] === 1)) continue;
     const name = p.ProcessName[r];
     score.set(name, peak ? Math.max(score.get(name) || 0, v) : (score.get(name) || 0) + v);
   }
@@ -242,20 +242,22 @@ function drillProcSeries(sys, metric, topN) {
   const top = names.slice(0, topN), topSet = new Set(top);
   const data = {};
   top.forEach(name => { data[name] = new Float64Array(n).fill(NaN); });
-  const other = new Float64Array(n), listed = new Float64Array(n);
+  const other = new Float64Array(n), listed = new Float64Array(n), game = new Float64Array(n).fill(NaN);
+  let hasGame = false;
   for (let i = 0; i < n; i++) {
     for (const r of sys.procsByTick.get(sys.stats.QpcMs[i]) || []) {
       const v = vals[r];
       if (!Number.isFinite(v)) continue;
       const name = p.ProcessName[r];
       listed[i] += v;
+      if (p.Game && p.Game[r] === 1) { game[i] = (Number.isFinite(game[i]) ? game[i] : 0) + v; hasGame = true; continue; }
       if (topSet.has(name)) data[name][i] = (Number.isFinite(data[name][i]) ? data[name][i] : 0) + v;
       else other[i] += v;
     }
   }
   const machine = metric === 'CpuPct' ? sys.stats.CpuTotalPct : metric === 'GpuPct' ? sys.stats.GpuTotalPct : null;
   const rest = machine ? Float64Array.from(listed, (l, i) => (Number.isFinite(machine[i]) ? Math.max(0, machine[i] - l) : NaN)) : null;
-  return { names: top, hiddenCount: Math.max(0, names.length - top.length), data, other, rest };
+  return { names: top, hiddenCount: Math.max(0, names.length - top.length), data, other, rest, game: hasGame ? game : null };
 }
 
 function drillProcText(p) {
@@ -1067,6 +1069,7 @@ function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax, flagMarks)
 
 // ---- processes lane: what the sampler's busiest processes were doing, on the same x axis; several views to choose from ----
 let drillProcCtx = null;
+const DRILL_GAME_COLOR = '#f2f2f2';
 const DRILL_PROC_COLORS = ['#e8a33d', '#6c9bd2', '#c06c84', '#8fbf6a', '#a98bd6', '#4fc1c0', '#d9d06b', '#e07b5b'];
 const DRILL_PROC_VIEWS = {
   cpu: { metric: 'CpuPct', stacked: true, unit: '%', label: 'CPU, stacked (% of whole machine)', max: 100, rest: 'Game and everything unlisted',
@@ -1098,15 +1101,17 @@ function drillRenderProc() {
     }
     return out;
   };
-  const sets = ps.names.map((name, j) => {
+  const gameSet = ps.game ? [{ label: 'Game', data: toPts(ps.game, view.stacked), borderColor: DRILL_GAME_COLOR, backgroundColor: view.stacked ? drillAlpha(DRILL_GAME_COLOR, 0.75) : DRILL_GAME_COLOR,
+    borderWidth: view.stacked ? 0.5 : 1.5, pointRadius: 0, fill: view.stacked, stack: view.stacked ? 's' : undefined }] : [];
+  const sets = gameSet.concat(ps.names.map((name, j) => {
     const c = DRILL_PROC_COLORS[j % DRILL_PROC_COLORS.length];
     return { label: name, data: toPts(ps.data[name], view.stacked), borderColor: c, backgroundColor: view.stacked ? drillAlpha(c, 0.7) : c,
       borderWidth: view.stacked ? 0.5 : 1.5, pointRadius: 0, fill: view.stacked, stack: view.stacked ? 's' : undefined };
-  });
+  }));
   if (view.stacked) {
     if (ps.hiddenCount) sets.push({ label: `${ps.hiddenCount} other listed process${ps.hiddenCount === 1 ? '' : 'es'}`, data: toPts(ps.other, true),
       borderColor: colors.muted, backgroundColor: drillAlpha(colors.muted, 0.6), borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
-    if (ps.rest) sets.push({ label: view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
+    if (ps.rest) sets.push({ label: ps.game ? view.rest.replace('Game and everything', 'Everything') : view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
       borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
   }
   sets.push(...drillFlagLegend(ctx.flagMarks));
