@@ -47,17 +47,21 @@ function drillPercentile(values, q) {
 function drillParseCsv(text) {
   const lines = text.split(/\r?\n/);
   const header = (lines[0] || '').replace(/^\uFEFF/, '').split(',').map(s => s.trim());
-  const missing = ['CPUStartTime', 'DisplayedTime'].filter(c => !header.includes(c));
+  // CPUStartTime: ms since the PresentMon trace started (the default). CPUStartQPCTime: absolute QPC ms
+  // (VPinPerfMon --timebase qpc, the default since migration 006). Both are stored in csv.CPUStartTime, so the
+  // analysis only ever sees "milliseconds on one clock"; csv.timeBase says which clock it is.
+  const timeCol = header.includes('CPUStartTime') ? 'CPUStartTime' : header.includes('CPUStartQPCTime') ? 'CPUStartQPCTime' : null;
+  const missing = [timeCol ? null : 'CPUStartTime (or CPUStartQPCTime)', header.includes('DisplayedTime') ? null : 'DisplayedTime'].filter(Boolean);
   if (missing.length) {
-    throw new Error(`this doesn't look like a PresentMon --v2_metrics CSV (no ${missing.join(' / ')} column)`);
+    throw new Error(`this doesn't look like a PresentMon --v2_metrics CSV (no ${missing.join(' and no ')} column)`);
   }
   const rows = [];
   for (let i = 1; i < lines.length; i++) if (lines[i].length) rows.push(lines[i]);
   const n = rows.length;
-  const csv = { n, header };
+  const csv = { n, header, timeBase: timeCol === 'CPUStartQPCTime' ? 'qpc' : 'relative' };
   const idx = {};
   for (const c of DRILL_NUM_COLS) {
-    idx[c] = header.indexOf(c);
+    idx[c] = header.indexOf(c === 'CPUStartTime' ? timeCol : c);
     csv[c] = new Float64Array(n).fill(NaN);
   }
   const swapIdx = header.indexOf('SwapChainAddress');

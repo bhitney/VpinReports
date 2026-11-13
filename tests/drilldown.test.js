@@ -10,8 +10,8 @@ const played = source.slice(source.indexOf('function drillPlayedAt('), source.in
 
 const context = vm.createContext({ escapeHtml: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;') });
 vm.runInContext(core + played, context);
-const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml } = vm.runInContext(
-  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml })', context);
+const { drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup } = vm.runInContext(
+  '({ drillParseCsv, drillAnalyze, drillPlayedAt, drillCause, drillLimiterCall, drillWhen, drillTilesHtml, drillParseLog, drillInferWarmup })', context);
 
 // 10 s at 10 ms per frame: warm-up 2 s, tail trim 1 s (graded window 2 s .. 9 s).
 function buildCsv(modeAt) {
@@ -200,4 +200,85 @@ test('tile groups: empty groups are dropped, extra classes and hover text are ke
   assert.ok(!html.includes('Load'));
   assert.match(html, /drill-tile warn" title="a &quot;quoted&quot; &lt;tip>"/);
   assert.match(html, /drill-tile wide">/);
+});
+
+// ---------------------------------------------------------------------------
+// Time base: VPinPerfMon writes CPUStartQPCTime (absolute QPC ms) by default; older captures have the
+// relative CPUStartTime. Both must give the same analysis.
+// ---------------------------------------------------------------------------
+
+// Same 10 s capture as buildCsv, with a configurable time column and origin. One 40 ms frame at i = 500 is a
+// 4-refresh stall; everything else is steady.
+function buildTimed(column, origin) {
+  const lines = [`${column},SwapChainAddress,PresentMode,FrameTime,CPUBusy,GPUBusy,DisplayedTime`];
+  let t = origin;
+  for (let i = 0; i < 1000; i++) {
+    const stall = i === 500;
+    const ft = stall ? 40 : 10;
+    lines.push(`${t.toFixed(4)},0xA,Hardware Composed: Independent Flip,${ft},${stall ? 38 : 1},1,${ft}`);
+    t += ft;
+  }
+  return lines.join('\n');
+}
+
+test('the time column is detected from the header and recorded', () => {
+  assert.equal(drillParseCsv(buildTimed('CPUStartTime', 1000)).timeBase, 'relative');
+  assert.equal(drillParseCsv(buildTimed('CPUStartQPCTime', 12423667.2169)).timeBase, 'qpc');
+  // Byte-order mark and CRLF line endings, as written by PresentMon on Windows.
+  const parsed = drillParseCsv('\uFEFF' + buildTimed('CPUStartQPCTime', 5000).replace(/\n/g, '\r\n'));
+  assert.equal(parsed.timeBase, 'qpc');
+  assert.equal(parsed.n, 1000);
+  assert.equal(parsed.CPUStartTime[0], 5000);
+});
+
+test('QPC values keep their precision (absolute origin around 1e7 ms)', () => {
+  const csv = drillParseCsv(buildTimed('CPUStartQPCTime', 12423667.2169));
+  assert.equal(csv.CPUStartTime[0], 12423667.2169);
+  assert.ok(Math.abs(csv.CPUStartTime[1] - csv.CPUStartTime[0] - 10) < 1e-6);
+});
+
+test('a QPC capture analyzes exactly like the same capture with a relative origin', () => {
+  const rel = drillAnalyze(drillParseCsv(buildTimed('CPUStartTime', 1000)), null, cfg, NaN);
+  const qpc = drillAnalyze(drillParseCsv(buildTimed('CPUStartQPCTime', 12423667.2169)), null, cfg, NaN);
+  assert.equal(qpc.frames, rel.frames);
+  assert.equal(qpc.misses.length, 1);
+  assert.equal(rel.misses.length, 1);
+  assert.equal(qpc.grade, rel.grade);
+  assert.ok(qpc.grade, 'the capture is gradeable');
+  assert.ok(Math.abs(qpc.score - rel.score) < 1e-9);
+  assert.equal(qpc.warmupSec, 2);
+  assert.ok(Math.abs(qpc.duration - rel.duration) < 1e-6);
+  // The chart x axis is seconds since the first frame, whatever the origin.
+  assert.ok(Math.abs((qpc.misses[0].ms) - (rel.misses[0].ms)) < 1e-6);
+});
+
+test('the warm-up cutoff is relative to the first frame, not to zero', () => {
+  const csv = drillParseCsv(buildTimed('CPUStartQPCTime', 12423667.2169));
+  const res = drillAnalyze(csv, null, { TrimStartSeconds: 3, TrimEndSeconds: 1, MinFrames: 10 }, NaN);
+  assert.ok(Math.abs(res.warmEnd - (csv.CPUStartTime[0] + 3000)) < 1e-6);
+  assert.equal(res.t0, csv.CPUStartTime[0]);
+  assert.equal(res.warmupSec, 3);
+});
+
+test('the warm-up from the console log works for relative and QPC captures', () => {
+  const rel = 'First frame CPUStartTime: 3569.31ms, Warm-up threshold: 33569.31ms\nParsed 1 total frames';
+  const qpc = 'First frame CPUStartTime: 21932929.82ms, Warm-up threshold: 21962929.82ms\nParsed 1 total frames';
+  assert.ok(Math.abs(drillParseLog(rel) - 30) < 1e-6);
+  assert.ok(Math.abs(drillParseLog(qpc) - 30) < 1e-6);
+  // No first-frame line: fall back to the configured delay.
+  assert.equal(drillParseLog('Data collection will begin after 15 second delay (warm-up period).'), 15);
+  assert.ok(Number.isNaN(drillParseLog('nothing useful')));
+});
+
+test('the warm-up can be inferred from the stored frame count with a QPC origin', () => {
+  const csv = drillParseCsv(buildTimed('CPUStartQPCTime', 12423667.2169));
+  const framesAfter = secs => csv.CPUStartTime.filter(t => t >= csv.CPUStartTime[0] + secs * 1000).length;
+  const inferred = drillInferWarmup(csv, { PresentMonFrameCount: framesAfter(4) });
+  assert.equal(inferred.sec, 4);
+  assert.match(inferred.source, /inferred/);
+});
+
+test('a CSV with neither time column is refused with a message that names both', () => {
+  assert.throws(() => drillParseCsv('FrameTime,DisplayedTime\n1,2'), /CPUStartTime \(or CPUStartQPCTime\)/);
+  assert.throws(() => drillParseCsv('CPUStartQPCTime,FrameTime\n1,2'), /DisplayedTime/);
 });
