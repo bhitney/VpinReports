@@ -322,6 +322,11 @@ chart_defs = [
         "xlabel": "GPU Average (%)", "ylabel": "FPS Average",
     },
     {
+        "id": "fpsVsGpuMem", "title": "FPS Average vs GPU Memory Average",
+        "x": "GpuMemoryAverage", "y": "FpsAverage",
+        "xlabel": "GPU Memory Average (units)", "ylabel": "FPS Average",
+    },
+    {
         "id": "cpuVsGpu", "title": "CPU Average vs GPU Average",
         "x": "CpuAverage", "y": "GpuAverage",
         "xlabel": "CPU Average (%)", "ylabel": "GPU Average (%)",
@@ -330,11 +335,6 @@ chart_defs = [
         "id": "frameTimeStability", "title": "Frame Time Avg vs Frame Time Std Dev (stutter indicator)",
         "x": "FrameTimeAvg", "y": "FrameTimeStdDev",
         "xlabel": "Frame Time Avg (ms)", "ylabel": "Frame Time Std Dev (ms)",
-    },
-    {
-        "id": "fpsVsGpuMem", "title": "FPS Average vs GPU Memory Average",
-        "x": "GpuMemoryAverage", "y": "FpsAverage",
-        "xlabel": "GPU Memory Average (units)", "ylabel": "FPS Average",
     },
     {
         "id": "blame", "title": "Blame CPU% vs Blame GPU% (bottleneck attribution)",
