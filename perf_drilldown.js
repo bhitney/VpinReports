@@ -243,21 +243,21 @@ function drillProcSeries(sys, metric, topN) {
   const data = {};
   top.forEach(name => { data[name] = new Float64Array(n).fill(NaN); });
   const other = new Float64Array(n), listed = new Float64Array(n), game = new Float64Array(n).fill(NaN);
-  let hasGame = false;
+  let hasGame = false, gameName = '';
   for (let i = 0; i < n; i++) {
     for (const r of sys.procsByTick.get(sys.stats.QpcMs[i]) || []) {
       const v = vals[r];
       if (!Number.isFinite(v)) continue;
       const name = p.ProcessName[r];
       listed[i] += v;
-      if (p.Game && p.Game[r] === 1) { game[i] = (Number.isFinite(game[i]) ? game[i] : 0) + v; hasGame = true; continue; }
+      if (p.Game && p.Game[r] === 1) { game[i] = (Number.isFinite(game[i]) ? game[i] : 0) + v; hasGame = true; if (!gameName && name) gameName = String(name).replace(/\.exe$/i, ''); continue; }
       if (topSet.has(name)) data[name][i] = (Number.isFinite(data[name][i]) ? data[name][i] : 0) + v;
       else other[i] += v;
     }
   }
   const machine = metric === 'CpuPct' ? sys.stats.CpuTotalPct : metric === 'GpuPct' ? sys.stats.GpuTotalPct : null;
   const rest = machine ? Float64Array.from(listed, (l, i) => (Number.isFinite(machine[i]) ? Math.max(0, machine[i] - l) : NaN)) : null;
-  return { names: top, hiddenCount: Math.max(0, names.length - top.length), data, other, rest, game: hasGame ? game : null };
+  return { names: top, hiddenCount: Math.max(0, names.length - top.length), data, other, rest, game: hasGame ? game : null, gameName: gameName || 'Game' };
 }
 
 function drillProcText(p) {
@@ -841,7 +841,7 @@ async function drillOfferReconnect() {
 const DRILL_MODE_COLOR = '#f050f8';
 const DRILL_FLAG_COLOR = '#b07cff';
 // Legend-only entry for the vertical user-flag lines (SendUserFlag.exe); nothing when the run has no flags.
-const drillFlagLegend = flagMarks => (flagMarks.length ? [{ label: 'User flag', data: [], borderColor: DRILL_FLAG_COLOR, backgroundColor: DRILL_FLAG_COLOR, borderWidth: 2, pointRadius: 0 }] : []);
+const drillFlagLegend = flagMarks => (flagMarks.length ? [{ type: 'scatter', label: 'User flag', data: flagMarks.map(x => ({ x, y: 0, flag: true })), order: 0, pointStyle: 'rectRot', pointRadius: 6, pointHoverRadius: 9, backgroundColor: DRILL_FLAG_COLOR, borderColor: DRILL_FLAG_COLOR }] : []);
 const DRILL_MODE_INFO = {
   'Hardware: Independent Flip': 'The game has the screen to itself. Frames go straight to the display with no Windows compositing.',
   'Hardware Composed: Independent Flip': 'Frames still go straight to the display, but Windows is blending a small overlay (such as a cursor or notification) in hardware, without copying the frame. Performance is essentially the same as plain Independent Flip.',
@@ -967,7 +967,8 @@ const drillBandsPlugin = {
     });
     ctx.strokeStyle = drillAlpha(DRILL_FLAG_COLOR, 0.9);
     ctx.lineWidth = 2;
-    (opts.flagMarks || []).forEach(v => {
+    const flagIdx = chart.data.datasets.findIndex(d => d.label === 'User flag');
+    (flagIdx < 0 || chart.isDatasetVisible(flagIdx) ? opts.flagMarks || [] : []).forEach(v => {
       const px = x.getPixelForValue(v);
       if (px < a.left || px > a.right) return;
       ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
@@ -1050,7 +1051,7 @@ function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax, flagMarks)
       ...drillFlagLegend(flagMarks),
     ] },
     options: (() => {
-      const o = drillLineOptions('%', xMax, { bands, marks, modeMarks, flagMarks }, item => `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`);
+      const o = drillLineOptions('%', xMax, { bands, marks, modeMarks, flagMarks }, item => (item.raw.flag ? 'User flag' : `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`));
       o.scales.y.max = 100;
       if (sys.procs) o.plugins.tooltip.callbacks.afterBody = items => {
         const procs = drillSysProcsAt(sys, items[0]?.raw?.i);
@@ -1101,7 +1102,7 @@ function drillRenderProc() {
     }
     return out;
   };
-  const gameSet = ps.game ? [{ label: 'Game', data: toPts(ps.game, view.stacked), borderColor: DRILL_GAME_COLOR, backgroundColor: view.stacked ? drillAlpha(DRILL_GAME_COLOR, 0.75) : DRILL_GAME_COLOR,
+  const gameSet = ps.game ? [{ label: ps.gameName, data: toPts(ps.game, view.stacked), borderColor: DRILL_GAME_COLOR, backgroundColor: view.stacked ? drillAlpha(DRILL_GAME_COLOR, 0.75) : DRILL_GAME_COLOR,
     borderWidth: view.stacked ? 0.5 : 1.5, pointRadius: 0, fill: view.stacked, stack: view.stacked ? 's' : undefined }] : [];
   const sets = gameSet.concat(ps.names.map((name, j) => {
     const c = DRILL_PROC_COLORS[j % DRILL_PROC_COLORS.length];
@@ -1114,9 +1115,9 @@ function drillRenderProc() {
     if (ps.rest) sets.push({ label: ps.game ? view.rest.replace('Game and everything', 'Everything') : view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
       borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
   }
-  sets.push(...drillFlagLegend(ctx.flagMarks));
-  const o = drillLineOptions(view.unit, ctx.xMax,
-    item => `${item.dataset.label}: ${item.parsed.y.toFixed(view.unit === '%' ? 1 : view.unit === 'MB/s' ? 2 : 0)} ${view.unit}`);
+  sets.push(...drillFlagLegend(ctx.flagMarks).map(d => ({ ...d, stack: 'flag' })));
+  const o = drillLineOptions(view.unit, ctx.xMax, { flagMarks: ctx.flagMarks },
+    item => (item.raw.flag ? 'User flag' : `${item.dataset.label}: ${item.parsed.y.toFixed(view.unit === '%' ? 1 : view.unit === 'MB/s' ? 2 : 0)} ${view.unit}`));
   o.plugins.decimation = { enabled: false };
   o.interaction = { mode: 'index', axis: 'x', intersect: false };
   o.plugins.tooltip.itemSort = (a, b) => b.parsed.y - a.parsed.y;
