@@ -96,6 +96,8 @@ cols += [c for c in BLAME_NUMERIC + BLAME_TEXT if c in df.columns and c not in c
 if HAS_GAME_RATING:
     cols.append("GameRating")
 HAS_GAME_ID = "GameID" in df.columns
+if "RunId" in df.columns:
+    cols.append("RunId")
 HAS_VR = "IsVR" in df.columns
 if HAS_GAME_ID:
     cols.append("GameID")
@@ -888,6 +890,12 @@ PERF_CSS += """#tab-perf {
     padding: 2px 8px; border-radius: 0.5rem; border: 1px solid var(--cp-border);
     background: var(--cp-surface-soft); color: var(--cp-text); cursor: pointer; font-size: 12px;
   }
+  .purge-panel { background: var(--cp-surface); border: 1px solid var(--cp-warning); border-radius: var(--radius); padding: 10px 12px; margin: 12px 0; font-size: 13px; }
+  .purge-panel[hidden] { display: none; }
+  .purge-panel ul { margin: 8px 0; padding-left: 18px; max-height: 200px; overflow: auto; color: var(--cp-text-muted); }
+  .purge-panel li { margin: 3px 0; }
+  .purge-panel button, #drillPurgeBtn { padding: 2px 8px; border-radius: 0.5rem; border: 1px solid var(--cp-border); background: var(--cp-surface-soft); color: var(--cp-text); cursor: pointer; font-size: 12px; }
+  #drillPurgeBtn.marked { border-color: var(--cp-warning); color: var(--cp-warning); }
 }
 """
 
@@ -905,10 +913,12 @@ the same rules as VPinPerfMon and checked against the values stored in the datab
     <button type="button" id="drillFolderBtn">Connect logs folder&hellip;</button>
     <button type="button" id="drillReconnectBtn" hidden></button>
     <button type="button" id="drillFileBtn">Open CSV&hellip;</button>
+    <button type="button" id="drillPurgeBtn" hidden></button>
     <span class="drill-count" id="drillCount"></span>
     <input type="file" id="drillFolderInput" webkitdirectory multiple hidden>
     <input type="file" id="drillFileInput" accept=".csv,.txt,text/csv,text/plain" multiple hidden>
   </div>
+  <div id="purgePanel" class="purge-panel" hidden></div>
   <div id="drillLogsHint" class="drill-hint" hidden></div>
   <div id="drillStatus" class="drill-status">No run selected. Tip: you can also drop a PresentMon CSV (plus its .txt log, if you have it) anywhere in this section.</div>
   <div id="drillResults" hidden>
@@ -1027,6 +1037,7 @@ PERF_BODY = f"""<h1>Performance Stats</h1>
   <div><b id="summaryTables"></b>Unique tables</div>
   <div><b id="summaryMissingFps"></b>Rows missing FPS data</div>
   <div><b id="summaryReruns"></b>Recommended re-runs</div>
+  <div><b id="summaryPurge" style="color: var(--cp-warning)">0</b>Pending purge <a href="#purgePanel" id="summaryPurgeLink" hidden>review</a></div>
 </div>
 
 <div class="filter-bar">
@@ -1138,6 +1149,10 @@ before drawing conclusions about the table itself.</p>
 PERF_SCRIPT = f"""(() => {{
 const rawRecords = {json.dumps(all_records)};
 rawRecords.forEach((row, i) => {{ row._i = i; }});
+const PURGE_STORE = 'vpin-purge-list';
+const purgeMarked = new Map();
+try {{ for (const e of JSON.parse(localStorage.getItem(PURGE_STORE) || '[]')) purgeMarked.set(e.key, e); }} catch (err) {{ /* ignore */ }}
+const purgeKey = r => r.RunId != null ? String(r.RunId) : `${{r.GameID ?? ''}}|${{r.EntryDateTime}}|${{r.RawFile ?? ''}}`;
 const anomalySpecs = {json.dumps(anomaly_specs)};
 const performanceScoreWeights = {json.dumps(PERFORMANCE_SCORE_WEIGHTS)};
 const referencePool = {json.dumps({c: [None if pd.isna(v) else float(v) for v in REFERENCE_POOL[c]] for c in _score_cols})};
@@ -1300,6 +1315,7 @@ function buildClientState(minRating, startDate, endDate, vrMode, latestOnly) {{
     row.EntryDateDate <= endDate &&
     emuOk(row) &&
     gpuOk(row) &&
+    !purgeIsMarked(row) &&
     (vrMode === 'all' || (vrMode === 'vr') === (row.IsVR === 1))
   );
   if (latestOnly) filtered = keepLatestRuns(filtered);

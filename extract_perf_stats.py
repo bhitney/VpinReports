@@ -29,7 +29,7 @@ import pandas as pd
 # back from here.
 # ---------------------------------------------------------------------------
 QUERY = """
-SELECT g.GameId, g.GameDisplay,
+SELECT cps.Id AS RunId, g.GameId, g.GameDisplay,
 CAST(COALESCE(NULLIF(TRIM(g.GameRating), ''), '0') AS INTEGER) AS GameRating,
 g.EMUID, e.EmuDisplay, IsVR, EntryDate, SampleCount, PresentMonFrameCount, CpuAverage, CpuMin, CpuMax, GpuAverage, GpuMin, GpuMax, GpuMemoryAverage,
 GpuMemoryMin, GpuMemoryMax, FpsAverage, FpsMin, FpsMax, Fps1PctLow, FpsPoint1PctLow, FrameTimeAvg, FrameTimeMin, FrameTimeMax, FrameTime999th, FrameTime995th, FrameTime99th,
@@ -64,13 +64,22 @@ OPTIONAL_COLUMNS = [
 ]
 
 
-def build_query(con):
-    """QUERY plus whichever OPTIONAL_COLUMNS exist in this database."""
+def build_query(con, extra_where=None):
+    """QUERY plus whichever OPTIONAL_COLUMNS exist in this database.
+
+    Runs soft-deleted (purged) with CustomPerfStats.Deleted = 1 are skipped; databases without
+    that column (migration 008) return every run. extra_where is an optional SQL condition
+    that is ANDed in.
+    """
     have = {row[1] for row in con.execute("PRAGMA table_info(CustomPerfStats)")}
     extra = [c for c in OPTIONAL_COLUMNS if c in have]
-    if not extra:
-        return QUERY
-    return QUERY.replace("\nFROM CustomPerfStats cps", ", " + ", ".join(extra) + "\nFROM CustomPerfStats cps", 1)
+    query = QUERY
+    if extra:
+        query = query.replace("\nFROM CustomPerfStats cps", ", " + ", ".join(extra) + "\nFROM CustomPerfStats cps", 1)
+    conditions = (["COALESCE(cps.Deleted, 0) = 0"] if "Deleted" in have else []) + ([extra_where] if extra_where else [])
+    if conditions:
+        query = query.rstrip() + "\nWHERE " + " AND ".join(conditions) + "\n"
+    return query
 
 
 def resolve_db_path():

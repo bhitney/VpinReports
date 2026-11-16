@@ -286,7 +286,7 @@ def build_perf(args):
             return message(f"Database not found at {args.db}"), "no data"
         con = sqlite3.connect(args.db)
         try:
-            query = ex.build_query(con).rstrip() + f"\nWHERE g.EMUID IN ({args.emus})\n"
+            query = ex.build_query(con, f"g.EMUID IN ({args.emus})")
             src = pd.read_sql_query(query, con)
         except Exception as e:
             return message(f"Could not read CustomPerfStats: {e}"), "no data"

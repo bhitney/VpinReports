@@ -67,4 +67,40 @@ The source used is shown under the recheck table. A CSV that doesn't match any r
 
 Each stall (a graded frame held for 1.5 refreshes or more) is classified as CPU, GPU, present-mode switch, app waiting or display/compositor by the same rules as VPinPerfMon (BlameVersion 4); see `DATABASE_COLUMNS.md` for the rules. The recheck compares the five stall counts and the blame values with the database and shows a warning if they differ. The drill-down leads with **GPU load** (median GPU busy as a percent of the refresh, banded by `GPU_LOAD_BANDS` in `report_config.py`), then shows blame with the stall counts behind it. Blame is empty when there are fewer than `CfgBlameMinStalls` CPU+GPU stalls, which is most runs. A derived limiter call (GPU-limited, CPU-limited, neither, unclear) needs both the load and the stall causes. Databases that have not been migrated lack these columns; the report still builds and simply omits them, and rows graded with an older blame formula are labelled legacy.
 
-The drill-down can also switch between swap chains, mark present-mode changes, and flag a possible screen-recording session; the playfield is the chain with the highest GPU load when several tie on frame count.
+the playfield is the chain with the highest GPU load when several tie on frame count.
+
+## Purging runs
+
+A run can be spurious (a test, a screen recording, a bad capture). Purging is a soft delete: the `CustomPerfStats` row is flagged `Deleted = 1` with a UTC time in `DeletedUtc`, and the report skips it. Nothing is removed from the database or the logs folder, and a run can be restored by setting `Deleted = 0, DeletedUtc = NULL`. It needs VPinPerfMon migration `008_add_soft_delete.sql`; a database without it still builds the report, but cannot purge.
+
+The report is a static page and is often viewed on a different PC from the cab, so purging takes two steps.
+
+1. **Mark runs in the report (any PC).** On the Performance Stats tab, open a run in the **Run drill-down** and click **Mark for purge**. Marked runs disappear from the report straight away, and the **Pending purge** tile counts them (its **review** link jumps to the list). The list is kept in the browser (`localStorage`), so it survives a reload or a rebuilt report, but it is per browser and per file location. In the **Purge list** you can **Unmark** a run, **Clear list**, **Copy JSON**, or **Export purge file**, which downloads `purge_<timestamp>.json`:
+
+   ```json
+   { "version": 1, "createdAt": "2026-11-16T16:16:34.021Z",
+     "entries": [ { "id": 1615, "table": "Breaking Bad (Original 2026)", "entryDateTime": "2026-11-15 21:42:33",
+                    "grade": "F", "fileAssetStem": "20261115164007_Breaking Bad (Original 2026)" } ] }
+   ```
+
+   `id` is `CustomPerfStats.Id`. `entryDateTime` and `fileAssetStem` are checked against the row. If the report was built from a `--perf-csv` that lacks `RunId`, `id` is `null` and that entry cannot be applied.
+
+2. **Apply on the cab, then rebuild.** Copy the file to the cab, run `purge_runs.py`, then rebuild the report; the purged runs are gone from the next build.
+
+```cmd
+python purge_runs.py "p:\somefolder\somefiles\purge*.json"           (dry run: shows what would happen)
+python purge_runs.py "p:\somefolder\somefiles\purge*.json" --apply
+python purge_runs.py --apply --backup --delete-manifests
+```
+
+| Argument | Purpose |
+|---|---|
+| `PATH ...` | A manifest file, a folder (its `purge*.json` files), or a wildcard pattern. Quote wildcards. Default: `purge*.json` in the current folder. |
+| `--db FILE` | Database to update. Default: `DB_PATH` in `report_config.py`. |
+| `--apply` | Make the changes. Without it the script only reports. |
+| `--backup [DIR]` | Opt-in. Before applying, copy the database to `<name>.<timestamp>.bak` next to it, or in `DIR`. Only done when there is something to purge. |
+| `--delete-manifests` | Opt-in. After `--apply`, delete each manifest whose entries were all handled. |
+
+Each entry is checked before anything changes: the `id` must exist, and `entryDateTime` and `fileAssetStem` must match that row. A mismatch is skipped and reported, never purged. Entries already purged, or whose row no longer exists, count as handled, so running it twice is safe. A manifest with a skipped entry, or one that cannot be read, is kept even with `--delete-manifests`. Exit code: `0` all handled, `1` something was skipped, `2` could not run (for example, migration 008 missing). The script is non-interactive, so it can go in an existing `.bat` on the cab, for example `python purge_runs.py D:\drop --apply --delete-manifests` before the report build.
+
+The Play History tab reads `CustomGameLog` and is not affected.

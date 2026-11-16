@@ -603,8 +603,9 @@ function drillRefreshRuns() {
     `<option value="${r._i}">${mark(r)}${escapeHtml(r.Table)} &mdash; ${escapeHtml(r.EntryDateTime)}` +
     `${r.StutterGrade ? ` &mdash; grade ${escapeHtml(r.StutterGrade)}` : ''}</option>`).join('');
   select.value = drillRid != null ? String(drillRid) : '';
+  purgeRender();
   const onDisk = rows.filter(r => r.LogOnDisk === 1).length;
-  drillEl('drillCount').textContent = drillFiles.size
+  drillEl('drillCount')
     ? `${drillFolderLabel ? drillFolderLabel + ': ' : ''}${drillRunFileCount()} CSV file(s) connected${drillSysFileCount() ? ` (+ ${drillSysFileCount()} system sampler file(s))` : ''} · ● ${available} of these runs available`
     : drillLogs.checked && drillLogs.found ? `○ ${onDisk} of these runs had their CSV in the logs folder at build time` : '';
 }
@@ -656,6 +657,7 @@ async function drillOpenRecord(rid, scroll) {
   drillRid = rid;
   const rec = rawRecords[rid];
   drillRefreshRuns();
+  purgeRender();
   if (scroll) drillEl('drillSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
   if (!rec) return;
   if (!rec.RawFile) {
@@ -1440,5 +1442,75 @@ drillZone.addEventListener('drop', e => {
   e.preventDefault();
   drillUseFiles(e.dataTransfer.files);
 });
+// ---- purge marking (prototype): runs are marked here, kept in localStorage, and exported as a manifest for the cab ----
+function purgeIsMarked(row) { return purgeMarked.has(purgeKey(row)); }
+
+function purgeSave() {
+  try { localStorage.setItem(PURGE_STORE, JSON.stringify([...purgeMarked.values()])); } catch (err) { /* persistence is optional */ }
+}
+
+function purgeManifest() {
+  return JSON.stringify({ version: 1, createdAt: new Date().toISOString(), entries: [...purgeMarked.values()].map(({ key, ...entry }) => entry) }, null, 2);
+}
+
+function purgeToggle(rec) {
+  const key = purgeKey(rec);
+  if (purgeMarked.has(key)) purgeMarked.delete(key);
+  else purgeMarked.set(key, { key, id: rec.RunId ?? null, table: rec.Table, entryDateTime: rec.EntryDateTime, grade: rec.StutterGrade ?? null, fileAssetStem: drillSysStem(rec.RawFile) });
+  purgeSave();
+  applyReportFilters();
+}
+
+function purgeRender() {
+  drillEl('summaryPurge').textContent = purgeMarked.size;
+  drillEl('summaryPurgeLink').hidden = !purgeMarked.size;
+  const btn = drillEl('drillPurgeBtn');
+  const rec = drillRid != null ? rawRecords[drillRid] : null;
+  btn.hidden = !rec;
+  if (rec) {
+    const marked = purgeIsMarked(rec);
+    btn.classList.toggle('marked', marked);
+    btn.textContent = marked ? 'Unmark purge' : 'Mark for purge';
+  }
+  const panel = drillEl('purgePanel');
+  panel.hidden = !purgeMarked.size;
+  if (!purgeMarked.size) return;
+  panel.innerHTML = `<b>Purge list (${purgeMarked.size})</b> &mdash; hidden from this report. Export the file and run it against the database on the cab.` +
+    '<ul>' + [...purgeMarked.values()].map(e => `<li>${escapeHtml(e.table)} &middot; ${escapeHtml(e.entryDateTime)}${e.grade ? ' &middot; grade ' + escapeHtml(e.grade) : ''}` +
+      ` <button type="button" data-purge-unmark="${escapeHtml(e.key)}">Unmark</button></li>`).join('') + '</ul>' +
+    '<button type="button" id="purgeExport">Export purge file</button> <button type="button" id="purgeCopy">Copy JSON</button> <button type="button" id="purgeClear">Clear list</button>';
+}
+
+drillEl('summaryPurgeLink').addEventListener('click', e => {
+  e.preventDefault();
+  drillEl('purgePanel').scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
+drillEl('drillPurgeBtn').addEventListener('click', () => {
+  const rec = drillRid != null ? rawRecords[drillRid] : null;
+  if (rec) purgeToggle(rec);
+});
+drillEl('purgePanel').addEventListener('click', async e => {
+  const t = e.target.closest('button');
+  if (!t) return;
+  if (t.dataset.purgeUnmark) { purgeMarked.delete(t.dataset.purgeUnmark); purgeSave(); applyReportFilters(); return; }
+  if (t.id === 'purgeClear') { purgeMarked.clear(); purgeSave(); applyReportFilters(); return; }
+  if (t.id === 'purgeCopy') {
+    const ok = await drillCopyText(purgeManifest());
+    t.textContent = ok ? 'Copied' : 'Copy failed';
+    setTimeout(() => { t.textContent = 'Copy JSON'; }, 1500);
+    return;
+  }
+  if (t.id === 'purgeExport') {
+    const p = n => String(n).padStart(2, '0'), d = new Date();
+    const name = `purge_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.json`;
+    const url = URL.createObjectURL(new Blob([purgeManifest()], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+});
+
 drillRenderLogsHint();
 drillOfferReconnect();
+purgeRender();

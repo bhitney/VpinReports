@@ -35,7 +35,9 @@ Useful for splitting renderers. |
 | `TimeBase` | Which time column the PresentMon CSV carries: `relative` (`CPUStartTime`, ms since the trace started) or `qpc` (`CPUStartQPCTime`, absolute QPC ms). NULL means an old row, treat it as `relative`. |
 | `FileAnalysisPath` | Absolute path to the text log of the run. May no longer exist if logs were cleaned up. |
 | `FileRawDataPath` |
-| `FileAssetStem` | The part of the file names that is the same for every file of the run, for example `20261112133050_Blue Note (Gottlieb 1979)`. It has no folder and no extension, so it works on any device: look in your own copy of the log folder (and its archive) for `<Prefix>_<FileAssetStem>.<extension>`. The files are `PresentMon_<stem>.csv` (frame data), `PresentMon_<stem>.txt` (console log), `SysStats_<stem>.csv`, `SysProcs_<stem>.csv` and `SysEvents_<stem>.csv` (system sampler, newer runs only). Treat it as a plain string, not a glob: game names can contain `[ ] * ?`. Match with the prefix and extension rather than `*_<stem>.*`, because a stem can be the tail of a longer one. Which files exist depends on the run (`--deletecsv true` or `--sysstats false` leave some out). Older rows were filled in from `FileRawDataPath` by migration 007. `NULL` means the stem is not known. |
+`NULL` means the stem is not known. |
+| `Deleted` | Soft-delete flag: `0` = kept (the default), `1` = purged. Added by VPinPerfMon migration 008. The report skips purged runs (`COALESCE(Deleted, 0) = 0`), and a database without the column still builds. Set by `purge_runs.py`. |
+| `DeletedUtc` | ISO 8601 UTC time the run was purged, for example `2026-11-16T16:20:00Z`. `NULL` while `Deleted = 0`. |
 
 ## Stutter grade (recommended measure)
 
