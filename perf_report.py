@@ -489,12 +489,18 @@ for c in chart_defs:
         c["brief"] = CHART_BRIEF[c["id"]]
 
 data["ConsistencyRatio"] = data["Fps1PctLow"] / data["FpsAverage"]
+# How close average FPS sits to the table's own target (display cadence): 1.0 = on target, lower = under or over.
+if "GradeHz" in data.columns:
+    data["FpsTargetAccuracy"] = (1 - (data["FpsAverage"] - data["GradeHz"]).abs() / data["GradeHz"]).clip(lower=0, upper=1)
+else:
+    data["FpsTargetAccuracy"] = float("nan")
 
 
 def records_for_frame(frame):
     frame_records = []
     record_cols = list(cols) + [
-        "Table", "SpreadRatio", "ConsistencyRatio", "GameRating", "EntryDateDate", "EntryDateTime"
+        "Table", "SpreadRatio", "ConsistencyRatio", "FpsTargetAccuracy", "GameRating",
+        "EntryDateDate", "EntryDateTime",
     ]
     for _, row in frame.iterrows():
         rec = {}
@@ -554,9 +560,25 @@ RERUN_THRESHOLD = 2  # rows flagged on >=2 independent metrics are the strongest
 PERFORMANCE_SCORE_WEIGHTS = [
     # (column, direction, weight, description)
     ("StutterScoreDT", "high", 0.60, "DisplayedTime stutter score -- the capture tool's recommended perceived-smoothness metric (already blends 99.5%ile/avg frame-time delta, std dev, and animation error internally)"),
-    ("FpsAverage", "high", 0.25, "Average FPS -- raw throughput (StutterScoreDT self-normalizes to each table's own frame rate, so this is needed to catch slow-but-smooth tables)"),
+    ("FpsTargetAccuracy", "high", 0.25, "FPS vs target -- how close average FPS is to the table's own display cadence (higher FPS is not better; under or over target both count against it)"),
     ("ConsistencyRatio", "high", 0.15, "FPS 1% Low / FPS Average -- tail consistency (how close the worst 1% of frames stay to the average), independent of the other two"),
 ]
+
+_score_cols = [spec[0] for spec in PERFORMANCE_SCORE_WEIGHTS]
+# Fixed reference: one mean row per table across the whole dataset. Filtered views are scored against
+# this pool, so a table's score doesn't change with the date/emulator/rating filters.
+REFERENCE_POOL = data.groupby("Table")[_score_cols].mean()
+
+
+def reference_percentile(value, col, direction):
+    pool = REFERENCE_POOL[col].dropna()
+    if pd.isna(value) or pool.empty:
+        return float("nan")
+    below = (pool < value).sum()
+    equal = (pool == value).sum()
+    pct = (below + equal / 2.0) / len(pool) * 100
+    return pct if direction == "high" else 100 - pct
+
 
 def composite_score(row):
     total_w, total = 0.0, 0.0
@@ -603,19 +625,14 @@ def build_report_state(filtered_data):
     rerun_candidates = [r for r in anomaly_rows if r["score"] >= RERUN_THRESHOLD]
     watch_list = [r for r in anomaly_rows if r["score"] == 1]
 
-    score_cols = [spec[0] for spec in PERFORMANCE_SCORE_WEIGHTS]
+    score_cols = list(dict.fromkeys(_score_cols + ["FpsAverage"] + [c for c in ("StutterGradeScore",) if c in filtered_data.columns]))
     table_agg = filtered_data.groupby("Table", as_index=False)[score_cols].mean()
     table_agg["CaptureCount"] = filtered_data.groupby("Table").size().values
     table_agg = table_agg.dropna(subset=["FpsAverage"]).reset_index(drop=True)
     for col, direction, _, _ in PERFORMANCE_SCORE_WEIGHTS:
-        valid = table_agg[col].notna()
-        ranks = pd.Series(index=table_agg.index, dtype=float)
-        ranks[valid] = (
-            table_agg.loc[valid, col].rank(
-                pct=True, ascending=(direction == "high")
-            ) * 100
+        table_agg[f"_rank_{col}"] = table_agg[col].map(
+            lambda v, c=col, d=direction: reference_percentile(v, c, d)
         )
-        table_agg[f"_rank_{col}"] = ranks
     table_agg["PerformanceScore"] = table_agg.apply(composite_score, axis=1)
     ranked = table_agg.dropna(subset=["PerformanceScore"]).sort_values(
         "PerformanceScore", ascending=False
@@ -1082,13 +1099,13 @@ Hover a bubble for the emulator name, capture count, and averaged metrics.
 <h2 class="section">Top 10 Best / Worst Performing Tables</h2>
 <p class="muted">
 Ranked by a composite <b>Performance Score</b> (0&ndash;100, higher is better). Each table's captures are
-averaged, then the table is percentile-ranked against every other table on the metrics below, which are
+averaged, then the table is percentile-ranked against <b>all tables in the full dataset</b> (so scores don't shift with the filters) on the metrics below, which are
 blended using these weights (missing metrics are skipped and the remaining weights re-normalized):
 {''.join(f"<br>&bull; <b>{w*100:.0f}%</b> {desc}" for _, _, w, desc in PERFORMANCE_SCORE_WEIGHTS)}
 <br>Most of the weight is delegated to the capture tool's recommended perceived-smoothness score
 (DisplayedTime), which already blends the frame-pacing metrics internally &mdash; so std dev and animation
-error aren't scored again separately. Raw FPS is retained because that score self-normalizes to each
-table's own frame rate and is otherwise blind to a table running smoothly but slow. Treat this as a
+error aren't scored again separately. FPS is judged <b>relative to each table's target</b> (display cadence), not
+as raw throughput: a table at its target scores best, and one over or under it scores lower. Treat this as a
 starting point for investigation, not an absolute verdict. A &#9888; marks a table that's also in the
 Recommended Re-runs list below, since a flagged capture can pull a table's ranking in either direction.
 </p>
@@ -1123,6 +1140,15 @@ const rawRecords = {json.dumps(all_records)};
 rawRecords.forEach((row, i) => {{ row._i = i; }});
 const anomalySpecs = {json.dumps(anomaly_specs)};
 const performanceScoreWeights = {json.dumps(PERFORMANCE_SCORE_WEIGHTS)};
+const referencePool = {json.dumps({c: [None if pd.isna(v) else float(v) for v in REFERENCE_POOL[c]] for c in _score_cols})};
+function referencePercentile(value, column, direction) {{
+  const pool = referencePool[column].filter(v => v != null && Number.isFinite(v));
+  if (value == null || !Number.isFinite(value) || !pool.length) return null;
+  const below = pool.filter(v => v < value).length;
+  const equal = pool.filter(v => v === value).length;
+  const pct = (below + equal / 2) / pool.length * 100;
+  return direction === 'high' ? pct : 100 - pct;
+}}
 const chartDefs = {json.dumps(chart_defs)};
 const charts = {{}};
 const emuNames = [...new Set(rawRecords.map(row => row.EmuDisplay).filter(name => name != null))].sort();
@@ -1355,16 +1381,15 @@ function buildClientState(minRating, startDate, endDate, vrMode, latestOnly) {{
     Table,
     CaptureCount: rows.length,
     ...Object.fromEntries(performanceScoreWeights.map(([column]) => [column, mean(rows, column)])),
+    FpsAverage: mean(rows, 'FpsAverage'),
+    StutterGradeScore: mean(rows, 'StutterGradeScore'),
   }})).filter(row => finite(row.FpsAverage));
 
-  const metricRanks = Object.fromEntries(performanceScoreWeights.map(([column, direction]) => [
-    column, percentileRanks(rankedRows, column, direction),
-  ]));
-  rankedRows.forEach((row, index) => {{
+  rankedRows.forEach(row => {{
     let total = 0;
     let totalWeight = 0;
-    performanceScoreWeights.forEach(([column, , weight]) => {{
-      const rank = metricRanks[column].get(index);
+    performanceScoreWeights.forEach(([column, direction, weight]) => {{
+      const rank = referencePercentile(row[column], column, direction);
       if (finite(rank)) {{
         total += weight * rank;
         totalWeight += weight;
@@ -1680,7 +1705,7 @@ function renderPerfList(targetId, rows) {{
     <li><span class="rank">${{index + 1}}.</span>
     <span class="perf-table">${{escapeHtml(row.Table)}}</span>
     ${{rerunTables.has(row.Table) ? '<span class="score-badge" title="Also flagged as a recommended re-run">&#9888;</span>' : ''}}
-    <br><span class="muted">score ${{row.PerformanceScore.toFixed(1)}}/100
+    <br><span class="muted">${{finite(row.StutterGradeScore) ? `grade score ${{row.StutterGradeScore.toFixed(0)}} &middot; ` : ''}}rank score ${{row.PerformanceScore.toFixed(1)}}/100
     &middot; FPS avg ${{row.FpsAverage.toFixed(1)}}
     &middot; ${{row.CaptureCount}} capture(s)</span></li>`).join('')}}</ol>`;
 }}
