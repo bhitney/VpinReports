@@ -1153,6 +1153,13 @@ const PURGE_STORE = 'vpin-purge-list';
 const purgeMarked = new Map();
 try {{ for (const e of JSON.parse(localStorage.getItem(PURGE_STORE) || '[]')) purgeMarked.set(e.key, e); }} catch (err) {{ /* ignore */ }}
 const purgeKey = r => r.RunId != null ? String(r.RunId) : `${{r.GameID ?? ''}}|${{r.EntryDateTime}}|${{r.RawFile ?? ''}}`;
+// A marked run that is no longer in the data was purged from the database: drop it from the pending list.
+{{
+  const known = new Set(rawRecords.filter(r => r.RunId != null).map(r => String(r.RunId)));
+  let pruned = false;
+  if (known.size) for (const [k, e] of [...purgeMarked]) if (e.id != null && !known.has(String(e.id))) {{ purgeMarked.delete(k); pruned = true; }}
+  if (pruned) try {{ localStorage.setItem(PURGE_STORE, JSON.stringify([...purgeMarked.values()])); }} catch (err) {{ /* ignore */ }}
+}}
 const anomalySpecs = {json.dumps(anomaly_specs)};
 const performanceScoreWeights = {json.dumps(PERFORMANCE_SCORE_WEIGHTS)};
 const referencePool = {json.dumps({c: [None if pd.isna(v) else float(v) for v in REFERENCE_POOL[c]] for c in _score_cols})};
