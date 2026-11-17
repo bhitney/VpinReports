@@ -221,11 +221,40 @@ function drillSysProcsAt(sys, tick) {
     .sort((a, b) => Math.max(b.cpu || 0, b.gpu || 0) - Math.max(a.cpu || 0, a.gpu || 0));
 }
 
+// Why a second has a lot of unlisted CPU: the machine total minus every listed process (the game included), and the processes
+// that appeared or exited in that second. A process the sampler first sees in a sweep has no earlier sample, so it gets no CPU
+// value that second, and one that exits between sweeps is never seen again: short-lived helpers (ffmpeg, cmd) show up only as events.
+// Returns text lines, empty when the unlisted share is small or there is no SysProcs file.
+function drillUnlistedAt(sys, tick, minPct) {
+  if (!sys || !sys.procs || !sys.stats || !(tick >= 0) || tick >= sys.stats.n || !sys.stats.CpuTotalPct) return [];
+  const total = sys.stats.CpuTotalPct[tick];
+  if (!Number.isFinite(total)) return [];
+  const p = sys.procs;
+  let listed = 0;
+  for (const r of sys.procsByTick.get(sys.stats.QpcMs[tick]) || []) if (Number.isFinite(p.CpuPct[r])) listed += p.CpuPct[r];
+  const rest = Math.max(0, total - listed);
+  if (rest < (minPct || 10)) return [];
+  const lines = [`Unlisted CPU: ${rest.toFixed(0)}%`];
+  const e = sys.events;
+  if (e) {
+    const hi = sys.stats.QpcMs[tick], lo = tick > 0 ? sys.stats.QpcMs[tick - 1] : hi - 1000;
+    const started = new Set(), exited = new Set();
+    for (let i = 0; i < e.n; i++) {
+      if (!(e.QpcMs[i] > lo && e.QpcMs[i] <= hi)) continue;
+      if (e.Event[i] === 'ProcessStart') started.add(`${e.ProcessName[i]} (pid ${e.Pid[i]})`);
+      else if (e.Event[i] === 'ProcessExit') exited.add(`${e.ProcessName[i]} (pid ${e.Pid[i]})`);
+    }
+    if (started.size) lines.push(`  new this second (no CPU measured yet): ${[...started].join(', ')}`);
+    if (exited.size) lines.push(`  exited this second: ${[...exited].join(', ')}`);
+  }
+  return lines;
+}
+
 // Per-process values on the sampler's ticks. metric: CpuPct | GpuPct | WorkingSetMB | IoBytesPerSec.
 // The sampler only lists processes above a threshold, so a process is NaN on the ticks where it was not listed.
 // The `topN` processes with the most total (peak for WorkingSetMB) get their own series; the rest are summed into `other`.
-// For CpuPct/GpuPct `rest` is the machine total minus everything listed (the game, which VPinPerfMon leaves out, plus
-// all the small processes); it is NaN where the machine value is missing, and null for the other metrics.
+// For CpuPct/GpuPct `rest` is the machine total minus everything listed (the game is listed too); what remains is the small
+// and short-lived processes; it is NaN where the machine value is missing, and null for the other metrics.
 function drillProcSeries(sys, metric, topN) {
   if (!sys || !sys.procs || !sys.stats || !sys.stats.n) return null;
   const n = sys.stats.n, p = sys.procs, vals = p[metric];
@@ -1057,7 +1086,8 @@ function drillRenderSys(sys, csv, res, bands, marks, modeMarks, xMax, flagMarks)
       o.scales.y.max = 100;
       if (sys.procs) o.plugins.tooltip.callbacks.afterBody = items => {
         const procs = drillSysProcsAt(sys, items[0]?.raw?.i);
-        return procs.length ? ['Busiest processes:', ...procs.map(p => `  ${drillProcText(p)}`)] : [];
+        const tick = items[0]?.raw?.i;
+        return (procs.length ? ['Busiest processes:', ...procs.map(p => `  ${drillProcText(p)}`)] : []).concat(drillUnlistedAt(sys, tick));
       };
       return o;
     })(),
@@ -1075,10 +1105,10 @@ let drillProcCtx = null;
 const DRILL_GAME_COLOR = '#f2f2f2';
 const DRILL_PROC_COLORS = ['#e8a33d', '#6c9bd2', '#c06c84', '#8fbf6a', '#a98bd6', '#4fc1c0', '#d9d06b', '#e07b5b'];
 const DRILL_PROC_VIEWS = {
-  cpu: { metric: 'CpuPct', stacked: true, unit: '%', label: 'CPU, stacked (% of whole machine)', max: 100, rest: 'Game and everything unlisted',
-    help: 'Each band is one process. The top band is the machine total minus every process listed, which includes the game itself (VPinPerfMon leaves it out) and all the small ones.' },
-  gpu: { metric: 'GpuPct', stacked: true, unit: '%', label: 'GPU, stacked (% of busiest engine)', max: 100, rest: 'Game and everything unlisted',
-    help: 'Each band is one process\u2019s share of GPU engine time. The top band is the machine total minus every process listed, which includes the game.' },
+  cpu: { metric: 'CpuPct', stacked: true, unit: '%', label: 'CPU, stacked (% of whole machine)', max: 100, rest: 'Everything unlisted',
+    help: 'Each band is one process; the game is recorded every second and has its own band. The top band is the machine total minus every process listed: small processes, and short-lived ones (such as ffmpeg) that started or exited between samples and so have no CPU reading. Hover a spike to see which processes started or exited that second.' },
+  gpu: { metric: 'GpuPct', stacked: true, unit: '%', label: 'GPU, stacked (% of busiest engine)', max: 100, rest: 'Everything unlisted',
+    help: 'Each band is one process\u2019s share of GPU engine time. The top band is the machine total minus every process listed: small processes, and short-lived ones that started or exited between samples.' },
   cpuLines: { metric: 'CpuPct', stacked: false, unit: '%', label: 'CPU, one line per process (%)', help: 'Same data as the stacked view, as separate lines, so a single process spike is easy to see.' },
   mem: { metric: 'WorkingSetMB', stacked: false, unit: 'MB', label: 'Memory (working set, MB)', help: 'Working set of each process, shown only while the sampler listed it.' },
   io: { metric: 'IoBytesPerSec', stacked: false, unit: 'MB/s', scale: 1 / 1048576, label: 'Disk / network I/O (MB/s)', help: 'IO data rate of each process (file, network and device reads and writes together), shown only while the sampler listed it.' },
@@ -1114,7 +1144,7 @@ function drillRenderProc() {
   if (view.stacked) {
     if (ps.hiddenCount) sets.push({ label: `${ps.hiddenCount} other listed process${ps.hiddenCount === 1 ? '' : 'es'}`, data: toPts(ps.other, true),
       borderColor: colors.muted, backgroundColor: drillAlpha(colors.muted, 0.6), borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
-    if (ps.rest) sets.push({ label: ps.game ? view.rest.replace('Game and everything', 'Everything') : view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
+    if (ps.rest) sets.push({ label: view.rest, data: toPts(ps.rest, true), borderColor: colors.border, backgroundColor: drillAlpha(colors.border, 0.55),
       borderWidth: 0.5, pointRadius: 0, fill: true, stack: 's' });
   }
   sets.push(...drillFlagLegend(ctx.flagMarks).map(d => ({ ...d, stack: 'flag' })));
@@ -1124,6 +1154,7 @@ function drillRenderProc() {
   o.interaction = { mode: 'index', axis: 'x', intersect: false };
   o.plugins.tooltip.itemSort = (a, b) => b.parsed.y - a.parsed.y;
   o.plugins.tooltip.filter = item => item.parsed.y > 0;
+  if (view.metric === 'CpuPct') o.plugins.tooltip.callbacks.afterBody = items => drillUnlistedAt(ctx.sys, items[0]?.raw?.i);
   if (view.stacked) { o.scales.y.stacked = true; o.scales.y.max = view.max; }
   drillCharts.proc = new Chart(drillEl('drillProc'), { type: 'line', plugins: [drillBandsPlugin], data: { datasets: sets }, options: o });
   const zoomed = drillCharts.timeline && drillCharts.timeline.scales.x;

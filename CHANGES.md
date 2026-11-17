@@ -19,7 +19,7 @@ These changes make the drill-down read the newer VPinPerfMon captures. Everythin
 
 - **Stall table:** a "Busiest processes" column lists up to three processes from the sampler second covering each stall (for example `PinUpDisplayX CPU 4% GPU 6%`).
 - **System-load tooltip:** hovering a point lists the busiest processes for that second.
-- **Processes during the run** card, with a view selector: CPU stacked, GPU stacked, CPU lines, memory (working set) and disk/network I/O. The stacked views end with a grey band, "Game and everything unlisted": the machine total minus every listed process. It includes the game, which VPinPerfMon leaves out, and all the small processes. It is not a measurement of the game.
+The game is recorded every second and gets its own band. The stacked views end with a grey band, "Everything unlisted": the machine total minus every listed process. It holds small processes and short-lived ones (such as ffmpeg) that started or exited between samples and so have no CPU reading. When that band is 10% or more, the CPU tooltips add "Unlisted CPU" and the processes that started or exited in that second.
 - The sampler records only the top few processes each second, so a process that was never in the top few has no data, and a process can be missing for a second or two. Processes outside the top seven are grouped.
 
 ### Frame-time jitter tile
