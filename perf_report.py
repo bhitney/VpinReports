@@ -249,9 +249,8 @@ def _logs_info():
     if info["dir"] and os.path.isdir(info["dir"]):
         names = {n.lower() for n in os.listdir(info["dir"])}
         for i, p in raw.items():
-            if p:
-                name = re.split(r"[\\/]", p)[-1]
-                # Without a configured folder each run is also checked at its own recorded path.
+            if isinstance(p, str) and p:
+                name = re.split(r"[\\/]", p)[-1]                # Without a configured folder each run is also checked at its own recorded path.
                 on_disk[i] = int(name.lower() in names or (not folders and os.path.isfile(p)))
         info["checked"] = True
         info["found"] = int(sum(v == 1 for v in on_disk))
